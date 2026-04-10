@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tw-stock-ai-scheduler"
+version = "1.0.0"
+description = "台股 AI 摘要排程器，使用 Claude Agent SDK 定期產生 YT 精華摘要與每日新聞摘要"
+requires-python = ">=3.12"
+license = "MIT"
+dependencies = [
+    "claude-agent-sdk",
+    "schedule",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["test"]

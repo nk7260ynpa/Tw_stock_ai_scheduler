@@ -1,0 +1,31 @@
+# Logs
+*.log
+logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+.envrc
+
+# Claude Code
+CLAUDE.md
+
+# Plan
+plan/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# PID file
+*.pid
