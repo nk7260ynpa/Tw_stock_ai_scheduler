@@ -6,7 +6,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PYTHON="/Users/chen/miniconda3/envs/Torch/bin/python"
+# Conda 環境名稱（可透過 CONDA_ENV 環境變數覆蓋）
+CONDA_ENV="${CONDA_ENV:-Torch}"
+CONDA_BASE="${CONDA_BASE:-${HOME}/miniconda3}"
+PYTHON="${CONDA_BASE}/envs/${CONDA_ENV}/bin/python"
 PID_FILE="${SCRIPT_DIR}/ai_scheduler.pid"
 LOG_DIR="${SCRIPT_DIR}/logs"
 

@@ -10,13 +10,13 @@
 ## 架構
 
 ```
-Host macOS（Torch conda env）
+Host macOS（conda env）
   └── ai_scheduler.py（schedule 主迴圈，背景 daemon）
       ├── 19:15 → Agent SDK → /yt-summary skill
       └── 20:03 → Agent SDK → /news-summary skill
 
-認證：~/.claude/（Max 訂閱）
-工作目錄：/Users/chen/AI/Tw_stock/
+認證：~/.claude/（Max/Pro 訂閱）
+工作目錄：本專案的上層目錄（Tw_stock/）
 輸入：Tw_stock_DB/NewsContents/（逐字稿、新聞全文）
 輸出：Tw_stock_news/YTNews/、Tw_stock_news/DailyNews/
 ```
@@ -39,7 +39,9 @@ Tw_stock_ai_scheduler/
 ### 1. 安裝依賴
 
 ```bash
-/Users/chen/miniconda3/envs/Torch/bin/pip install claude-agent-sdk schedule
+# 使用指定的 conda 環境安裝
+conda activate Torch
+pip install claude-agent-sdk schedule
 ```
 
 ### 2. 啟動排程器
@@ -67,6 +69,20 @@ bash run.sh restart
 tail -f logs/ai_scheduler.log
 ```
 
+## 設定
+
+### Conda 環境
+
+`run.sh` 預設使用 `Torch` conda 環境。可透過環境變數覆蓋：
+
+```bash
+# 使用其他 conda 環境
+CONDA_ENV=myenv bash run.sh start
+
+# 指定 conda 安裝路徑
+CONDA_BASE=/opt/conda CONDA_ENV=myenv bash run.sh start
+```
+
 ## 認證方式
 
 使用 Claude Max/Pro 訂閱認證，透過 `~/.claude/` 目錄中的憑證自動登入。不需要 `ANTHROPIC_API_KEY`。
@@ -74,6 +90,6 @@ tail -f logs/ai_scheduler.log
 ## 環境需求
 
 - macOS
-- Python 3.12+（Torch conda 環境）
+- Python 3.12+（conda 環境）
 - Claude Code CLI 已登入 Max/Pro 訂閱
 - claude-agent-sdk、schedule 套件

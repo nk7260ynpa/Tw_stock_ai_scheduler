@@ -5,7 +5,6 @@
 - 20:03 — 每日新聞摘要（/news-summary skill）
 
 認證方式：Max/Pro 訂閱（透過 ~/.claude/ 憑證）。
-Python 環境：/Users/chen/miniconda3/envs/Torch
 """
 
 import asyncio
