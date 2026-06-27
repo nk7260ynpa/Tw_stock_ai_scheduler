@@ -308,6 +308,7 @@ async def run_summary_with_retry(
         "error": None,
     }
 
+    total_cost = 0.0  # 累計各次嘗試的等價成本，避免重試時少計
     for attempt in range(1, max_attempts + 1):
         outcome["attempts"] = attempt
         start_ts = time.time()
@@ -316,7 +317,8 @@ async def run_summary_with_retry(
         try:
             result = await runner(prompt)
             outcome["result"] = result.get("result")
-            outcome["cost"] = result.get("cost")
+            total_cost += result.get("cost") or 0
+            outcome["cost"] = total_cost
             outcome["is_error"] = bool(result.get("is_error"))
             outcome["num_messages"] = result.get("num_messages", 0)
         except Exception as exc:  # SDK 子程序 exit 1／暫時性過載等
@@ -378,50 +380,63 @@ async def backfill_one_day(
     Returns:
         dict: 含 ``date``/``status``/``elapsed``/``cost``/``file_size``/``error``。
     """
-    out_file = output_path_fn(date_str)
+    # 最外層保險：任何未預期例外（含 build_prompt／來源檢查）都收斂為單日
+    # failed，確保絕不逸出而中止整批。
+    try:
+        out_file = output_path_fn(date_str)
 
-    if out_file.exists() and out_file.stat().st_size > 0:
-        log.info("=== %s 略過：輸出檔已存在（可重入）===", date_str)
+        if out_file.exists() and out_file.stat().st_size > 0:
+            log.info("=== %s 略過：輸出檔已存在（可重入）===", date_str)
+            return {
+                "date": date_str, "status": "exists", "elapsed": 0.0,
+                "cost": 0.0, "file_size": out_file.stat().st_size,
+                "error": None,
+            }
+
+        if not source_available_fn(date_str):
+            log.warning("=== %s 略過：來源資料不存在 ===", date_str)
+            return {
+                "date": date_str, "status": "nosource", "elapsed": 0.0,
+                "cost": 0.0, "file_size": 0, "error": None,
+            }
+
+        if source_desc_fn:
+            log.info(
+                "=== %s 開始(來源：%s)===", date_str, source_desc_fn(date_str),
+            )
+        else:
+            log.info("=== %s 開始 ===", date_str)
+
+        start = time.monotonic()
+        outcome = await run_summary_with_retry(
+            build_prompt(date_str), out_file,
+            max_attempts=max_attempts, base_delay=base_delay, log=log,
+        )
+        elapsed = time.monotonic() - start
+
+        produced = outcome["produced"] and not outcome["is_error"]
+        size = out_file.stat().st_size if out_file.exists() else 0
+        status = "ok" if produced else "failed"
+
+        log_fn = log.info if produced else log.error
+        log_fn(
+            "%s %s: 嘗試=%d 訊息=%d 耗時=%.1fs cost=$%.4f "
+            "produced=%s error=%s size=%d",
+            date_str, "成功" if produced else "失敗", outcome["attempts"],
+            outcome["num_messages"], elapsed, outcome["cost"] or 0,
+            outcome["produced"], outcome["error"], size,
+        )
         return {
-            "date": date_str, "status": "exists", "elapsed": 0.0,
-            "cost": 0.0, "file_size": out_file.stat().st_size, "error": None,
+            "date": date_str, "status": status, "elapsed": elapsed,
+            "cost": outcome["cost"] or 0, "file_size": size,
+            "error": outcome["error"],
         }
-
-    if not source_available_fn(date_str):
-        log.warning("=== %s 略過：來源資料不存在 ===", date_str)
+    except Exception as exc:  # 最後防線：不讓任何例外中止整批
+        log.exception("=== %s 失敗：補抓時發生未預期例外 ===", date_str)
         return {
-            "date": date_str, "status": "nosource", "elapsed": 0.0,
-            "cost": 0.0, "file_size": 0, "error": None,
+            "date": date_str, "status": "failed", "elapsed": 0.0,
+            "cost": 0.0, "file_size": 0, "error": repr(exc),
         }
-
-    if source_desc_fn:
-        log.info("=== %s 開始（來源：%s）===", date_str, source_desc_fn(date_str))
-    else:
-        log.info("=== %s 開始 ===", date_str)
-
-    start = time.monotonic()
-    outcome = await run_summary_with_retry(
-        build_prompt(date_str), out_file,
-        max_attempts=max_attempts, base_delay=base_delay, log=log,
-    )
-    elapsed = time.monotonic() - start
-
-    produced = outcome["produced"] and not outcome["is_error"]
-    size = out_file.stat().st_size if out_file.exists() else 0
-    status = "ok" if produced else "failed"
-
-    log_fn = log.info if produced else log.error
-    log_fn(
-        "%s %s: 嘗試=%d 訊息=%d 耗時=%.1fs cost=$%.4f produced=%s error=%s size=%d",
-        date_str, "成功" if produced else "失敗", outcome["attempts"],
-        outcome["num_messages"], elapsed, outcome["cost"] or 0,
-        outcome["produced"], outcome["error"], size,
-    )
-    return {
-        "date": date_str, "status": status, "elapsed": elapsed,
-        "cost": outcome["cost"] or 0, "file_size": size,
-        "error": outcome["error"],
-    }
 
 
 def summarize_backfill(results: list[dict], log: logging.Logger) -> int:

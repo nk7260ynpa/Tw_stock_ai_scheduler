@@ -254,6 +254,8 @@ def test_retry_succeeds_after_failures(tmp_path):
     assert res["attempts"] == 3
     assert state["calls"] == 3
     assert delays == [15.0, 30.0]
+    # 成本應跨三次嘗試累加（每次 0.1）
+    assert res["cost"] == pytest.approx(0.3)
 
 
 def test_retry_exhausts_when_never_produced(tmp_path):
@@ -287,15 +289,23 @@ def test_retry_handles_exceptions(tmp_path):
 
 
 def test_retry_is_error_true_not_success(tmp_path):
-    """即使有檔，is_error=True 也不算成功。"""
+    """即使檔案確實被產出，is_error=True 仍不算成功（需重試/最終失敗）。"""
     out = tmp_path / "o.md"
-    runner, _ = _make_runner(1, out, is_error=True)
-    sleeper, _ = _recording_sleeper()
+
+    async def runner(prompt):
+        out.write_text("# 有檔但 SDK 回報錯誤", encoding="utf-8")
+        return {"result": "ERR", "cost": 0.1,
+                "is_error": True, "num_messages": 2}
+
+    sleeper, delays = _recording_sleeper()
     res = asyncio.run(summaries.run_summary_with_retry(
-        "p", out, runner=runner, sleeper=sleeper, max_attempts=1,
+        "p", out, runner=runner, sleeper=sleeper,
+        max_attempts=2, base_delay=5.0,
     ))
-    assert res["is_error"] is True
-    assert res["attempts"] == 1
+    assert res["produced"] is True   # 檔案確實存在
+    assert res["is_error"] is True   # 但 is_error → 不算成功
+    assert res["attempts"] == 2      # 故用盡重試
+    assert delays == [5.0]
 
 
 # ── 韌性：backfill_one_day 可重入／無來源／成功 ─────────────────────────
