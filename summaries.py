@@ -13,7 +13,6 @@
 
 from __future__ import annotations
 
-import logging
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -74,6 +73,26 @@ def yt_summary_date(today: date | None = None) -> str:
     """
     today = today or date.today()
     return today.strftime("%Y-%m-%d")
+
+
+def date_range(start_date: str, end_date: str) -> list[str]:
+    """產生 ``start_date`` 到 ``end_date``（含）的日期字串列表。
+
+    Args:
+        start_date: 起始日 ``YYYY-MM-DD``。
+        end_date: 結束日 ``YYYY-MM-DD``（含）。
+
+    Returns:
+        list[str]: 連續日期字串列表。
+    """
+    sy, sm, sd = map(int, start_date.split("-"))
+    ey, em, ed = map(int, end_date.split("-"))
+    cur, last = date(sy, sm, sd), date(ey, em, ed)
+    out: list[str] = []
+    while cur <= last:
+        out.append(cur.strftime("%Y-%m-%d"))
+        cur += timedelta(days=1)
+    return out
 
 
 def _weekday_zh(date_str: str) -> str:
@@ -240,8 +259,3 @@ async def run_prompt(prompt: str) -> dict:
             data["cost"] = message.total_cost_usd
             data["is_error"] = bool(message.is_error)
     return data
-
-
-def get_logger(name: str = "ai_summaries") -> logging.Logger:
-    """取得共用 logger（不重複加 handler）。"""
-    return logging.getLogger(name)

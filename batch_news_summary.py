@@ -14,21 +14,8 @@ import asyncio
 import logging
 import sys
 import time
-from datetime import date, timedelta
 
 import summaries
-
-
-def _date_range(start_date: str, end_date: str) -> list[str]:
-    """產生 ``start_date`` 到 ``end_date``（含）的日期字串列表。"""
-    sy, sm, sd = map(int, start_date.split("-"))
-    ey, em, ed = map(int, end_date.split("-"))
-    cur, last = date(sy, sm, sd), date(ey, em, ed)
-    out: list[str] = []
-    while cur <= last:
-        out.append(cur.strftime("%Y-%m-%d"))
-        cur += timedelta(days=1)
-    return out
 
 
 async def run_one(date_str: str, log: logging.Logger) -> dict:
@@ -54,8 +41,8 @@ async def run_one(date_str: str, log: logging.Logger) -> dict:
     size = out_file.stat().st_size if out_file.exists() else 0
 
     log.info(
-        "%s 完成: 訊息=%d 耗時=%.1fs cost=$%s is_error=%s produced=%s size=%d",
-        date_str, result["num_messages"], elapsed, result["cost"],
+        "%s 結束: 訊息=%d 耗時=%.1fs cost=$%.4f is_error=%s produced=%s size=%d",
+        date_str, result["num_messages"], elapsed, result["cost"] or 0,
         result["is_error"], produced, size,
     )
     return {
@@ -78,7 +65,7 @@ async def main() -> int:
     )
     log = logging.getLogger("batch_news")
 
-    dates = _date_range(start_date, end_date)
+    dates = summaries.date_range(start_date, end_date)
     log.info("批次處理 %d 天：%s ~ %s", len(dates), dates[0], dates[-1])
 
     results = []

@@ -36,6 +36,23 @@ def test_weekday_zh():
     assert summaries._weekday_zh("2026-06-22") == "週一"
 
 
+def test_date_range_inclusive():
+    """日期區間含頭含尾。"""
+    assert summaries.date_range("2026-06-10", "2026-06-12") == [
+        "2026-06-10", "2026-06-11", "2026-06-12",
+    ]
+
+
+def test_date_range_single_day():
+    assert summaries.date_range("2026-06-26", "2026-06-26") == ["2026-06-26"]
+
+
+def test_date_range_crosses_month():
+    assert summaries.date_range("2026-06-29", "2026-07-01") == [
+        "2026-06-29", "2026-06-30", "2026-07-01",
+    ]
+
+
 # ── 輸出路徑 ────────────────────────────────────────────────────────────
 def test_news_output_path():
     p = summaries.news_output_path("2026-06-26")
