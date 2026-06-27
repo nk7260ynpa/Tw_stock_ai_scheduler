@@ -13,6 +13,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
+import time
+from collections.abc import Awaitable, Callable
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -259,3 +263,200 @@ async def run_prompt(prompt: str) -> dict:
             data["cost"] = message.total_cost_usd
             data["is_error"] = bool(message.is_error)
     return data
+
+
+# ── 韌性執行（重試 + 產出防呆）──────────────────────────────────────────
+async def run_summary_with_retry(
+    prompt: str,
+    output_path: Path,
+    *,
+    max_attempts: int = 3,
+    base_delay: float = 15.0,
+    runner: Callable[[str], Awaitable[dict]] | None = None,
+    sleeper: Callable[[float], Awaitable[None]] | None = None,
+    log: logging.Logger | None = None,
+) -> dict:
+    """執行單筆摘要，含指數退避重試，並以「實際產出檔案」作為成功判準。
+
+    可吸收 Claude Agent SDK 子程序的暫時性失敗（如 ``Command failed with exit
+    code 1``，常見於撞到 Max 訂閱滾動用量上限／暫時過載），不讓單次失敗中止整批。
+
+    Args:
+        prompt: 完整任務指令。
+        output_path: 預期輸出檔；以其是否被本次嘗試產出判定成功。
+        max_attempts: 最多嘗試次數（含第一次）。
+        base_delay: 首次重試前的等待秒數，之後每次乘 2（指數退避）。
+        runner: 實際呼叫 SDK 的協程，預設 :func:`run_prompt`；測試可注入假物件。
+        sleeper: 退避等待協程，預設 :func:`asyncio.sleep`；測試可注入假物件。
+        log: 選用 logger，用於記錄各次嘗試。
+
+    Returns:
+        dict: 含 ``result``/``cost``/``is_error``/``num_messages``/``produced``/
+        ``attempts``/``error`` 欄位。``produced`` 為 True 且 ``is_error`` 為 False
+        才算成功。
+    """
+    runner = runner or run_prompt
+    sleeper = sleeper or asyncio.sleep
+
+    outcome = {
+        "result": None,
+        "cost": None,
+        "is_error": False,
+        "num_messages": 0,
+        "produced": False,
+        "attempts": 0,
+        "error": None,
+    }
+
+    for attempt in range(1, max_attempts + 1):
+        outcome["attempts"] = attempt
+        start_ts = time.time()
+        outcome["error"] = None
+        outcome["is_error"] = False
+        try:
+            result = await runner(prompt)
+            outcome["result"] = result.get("result")
+            outcome["cost"] = result.get("cost")
+            outcome["is_error"] = bool(result.get("is_error"))
+            outcome["num_messages"] = result.get("num_messages", 0)
+        except Exception as exc:  # SDK 子程序 exit 1／暫時性過載等
+            outcome["error"] = repr(exc)
+            outcome["is_error"] = True
+            if log:
+                log.warning(
+                    "第 %d/%d 次嘗試拋例外：%s", attempt, max_attempts, exc,
+                )
+
+        outcome["produced"] = output_is_fresh(output_path, start_ts)
+
+        if not outcome["is_error"] and outcome["produced"]:
+            return outcome
+
+        if attempt < max_attempts:
+            delay = base_delay * (2 ** (attempt - 1))
+            if log:
+                log.warning(
+                    "第 %d/%d 次未成功（produced=%s, error=%s），%.0f 秒後重試",
+                    attempt, max_attempts, outcome["produced"],
+                    outcome["error"], delay,
+                )
+            await sleeper(delay)
+
+    return outcome
+
+
+async def backfill_one_day(
+    date_str: str,
+    *,
+    build_prompt: Callable[[str], str],
+    output_path_fn: Callable[[str], Path],
+    source_available_fn: Callable[[str], bool],
+    source_desc_fn: Callable[[str], str] | None = None,
+    log: logging.Logger,
+    max_attempts: int = 3,
+    base_delay: float = 15.0,
+) -> dict:
+    """補抓單日摘要（可重入 + 容錯），回傳結果摘要 dict。
+
+    處理順序：
+
+    1. **可重入**：輸出檔已存在且非空 → 略過（``status="exists"``）。
+    2. **無來源**：來源資料不存在 → 略過（``status="nosource"``）。
+    3. 否則以 :func:`run_summary_with_retry` 執行；產出檔成功 → ``status="ok"``，
+       否則 ``status="failed"``（已記 ERROR，不拋例外、不中止整批）。
+
+    Args:
+        date_str: ``YYYY-MM-DD``。
+        build_prompt: 由日期組裝 prompt 的函式。
+        output_path_fn: 由日期取得輸出檔路徑的函式。
+        source_available_fn: 由日期判斷來源是否存在的函式。
+        source_desc_fn: 選用，回傳來源描述字串（如各來源檔數）供開始 log。
+        log: logger。
+        max_attempts: 單日最多嘗試次數。
+        base_delay: 重試退避基準秒數（傳給 :func:`run_summary_with_retry`）。
+
+    Returns:
+        dict: 含 ``date``/``status``/``elapsed``/``cost``/``file_size``/``error``。
+    """
+    out_file = output_path_fn(date_str)
+
+    if out_file.exists() and out_file.stat().st_size > 0:
+        log.info("=== %s 略過：輸出檔已存在（可重入）===", date_str)
+        return {
+            "date": date_str, "status": "exists", "elapsed": 0.0,
+            "cost": 0.0, "file_size": out_file.stat().st_size, "error": None,
+        }
+
+    if not source_available_fn(date_str):
+        log.warning("=== %s 略過：來源資料不存在 ===", date_str)
+        return {
+            "date": date_str, "status": "nosource", "elapsed": 0.0,
+            "cost": 0.0, "file_size": 0, "error": None,
+        }
+
+    if source_desc_fn:
+        log.info("=== %s 開始（來源：%s）===", date_str, source_desc_fn(date_str))
+    else:
+        log.info("=== %s 開始 ===", date_str)
+
+    start = time.monotonic()
+    outcome = await run_summary_with_retry(
+        build_prompt(date_str), out_file,
+        max_attempts=max_attempts, base_delay=base_delay, log=log,
+    )
+    elapsed = time.monotonic() - start
+
+    produced = outcome["produced"] and not outcome["is_error"]
+    size = out_file.stat().st_size if out_file.exists() else 0
+    status = "ok" if produced else "failed"
+
+    log_fn = log.info if produced else log.error
+    log_fn(
+        "%s %s: 嘗試=%d 訊息=%d 耗時=%.1fs cost=$%.4f produced=%s error=%s size=%d",
+        date_str, "成功" if produced else "失敗", outcome["attempts"],
+        outcome["num_messages"], elapsed, outcome["cost"] or 0,
+        outcome["produced"], outcome["error"], size,
+    )
+    return {
+        "date": date_str, "status": status, "elapsed": elapsed,
+        "cost": outcome["cost"] or 0, "file_size": size,
+        "error": outcome["error"],
+    }
+
+
+def summarize_backfill(results: list[dict], log: logging.Logger) -> int:
+    """結算批次結果並印出「成功／略過／失敗」明細，回傳行程退出碼。
+
+    Args:
+        results: 各日 :func:`backfill_one_day` 回傳的 dict 列表。
+        log: logger。
+
+    Returns:
+        int: 全部無失敗回 0，否則回 1。
+    """
+    ok = [r for r in results if r["status"] == "ok"]
+    exists = [r for r in results if r["status"] == "exists"]
+    nosource = [r for r in results if r["status"] == "nosource"]
+    failed = [r for r in results if r["status"] == "failed"]
+    total_cost = sum(r["cost"] for r in results)
+    total_elapsed = sum(r["elapsed"] for r in results)
+
+    log.info("=" * 50)
+    log.info("批次結束")
+    log.info("總耗時 %.1f 秒 (%.1f 分鐘)", total_elapsed, total_elapsed / 60)
+    log.info("總等價成本 $%.4f", total_cost)
+    log.info(
+        "成功 %d／略過 %d（已存在 %d、無來源 %d）／失敗 %d",
+        len(ok), len(exists) + len(nosource), len(exists), len(nosource),
+        len(failed),
+    )
+    if ok:
+        log.info("  成功：%s", ", ".join(r["date"] for r in ok))
+    if exists:
+        log.info("  略過-已存在：%s", ", ".join(r["date"] for r in exists))
+    if nosource:
+        log.info("  略過-無來源：%s", ", ".join(r["date"] for r in nosource))
+    if failed:
+        log.error("  失敗：%s", ", ".join(r["date"] for r in failed))
+
+    return 0 if not failed else 1

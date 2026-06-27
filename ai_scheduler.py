@@ -61,37 +61,36 @@ def _run_summary_sync(task_label: str, prompt: str, output_path: Path):
     """
     logger.info("排程觸發：%s", task_label)
     start = datetime.now()
-    start_ts = time.time()
 
     try:
         loop = asyncio.new_event_loop()
         try:
-            result = loop.run_until_complete(summaries.run_prompt(prompt))
+            # 含指數退避重試，可吸收暫時性 SDK 失敗（如 exit code 1／過載）
+            outcome = loop.run_until_complete(
+                summaries.run_summary_with_retry(
+                    prompt, output_path, log=logger,
+                )
+            )
         finally:
             loop.close()
 
         elapsed = (datetime.now() - start).total_seconds()
-        produced = summaries.output_is_fresh(output_path, start_ts)
+        produced = outcome["produced"] and not outcome["is_error"]
 
-        if result["is_error"]:
-            # SDK 自身回報錯誤
-            logger.error(
-                "%s 失敗（%.1f 秒）：SDK is_error，result=%s",
-                task_label, elapsed, result["result"],
-            )
-        elif not produced:
-            # 產出防呆：SDK 看似完成但預期檔案未產出（含空跑情形）
-            logger.error(
-                "%s 失敗（%.1f 秒）：預期輸出檔未產出 %s（result=%s，cost=$%.4f）",
-                task_label, elapsed, output_path,
-                result["result"], result["cost"] or 0,
-            )
-        else:
+        if produced:
             size = output_path.stat().st_size
             logger.info(
-                "%s 完成（%.1f 秒），產出 %s（%d bytes），花費 $%.4f",
-                task_label, elapsed, output_path.name, size,
-                result["cost"] or 0,
+                "%s 完成（%.1f 秒，嘗試 %d 次），產出 %s（%d bytes），花費 $%.4f",
+                task_label, elapsed, outcome["attempts"], output_path.name,
+                size, outcome["cost"] or 0,
+            )
+        else:
+            # 產出防呆：重試後仍未產出預期檔案（含空跑／SDK 錯誤情形）
+            logger.error(
+                "%s 失敗（%.1f 秒，嘗試 %d 次）：預期輸出檔未產出 %s"
+                "（is_error=%s，error=%s，result=%s）",
+                task_label, elapsed, outcome["attempts"], output_path,
+                outcome["is_error"], outcome["error"], outcome["result"],
             )
 
     except Exception:
