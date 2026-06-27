@@ -82,8 +82,9 @@ case "${1:-start}" in
     ;;
 
   restart)
-    # 以絕對路徑呼叫自身，避免相對檔名不在 PATH 造成 command not found
-    bash "${SCRIPT_DIR}/run.sh" stop
+    # 以絕對路徑呼叫自身，避免相對檔名不在 PATH 造成 command not found；
+    # stop 加 || true，避免 set -e 下 stop 偶發非 0 退出而擋住 start。
+    bash "${SCRIPT_DIR}/run.sh" stop || true
     sleep 1
     bash "${SCRIPT_DIR}/run.sh" start
     ;;
