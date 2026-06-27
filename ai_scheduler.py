@@ -1,10 +1,16 @@
 """台股 AI 摘要排程器。
 
 使用 Claude Agent SDK 搭配 schedule 套件，定期執行：
-- 19:15 — YT 逐字稿精華摘要（/yt-summary skill）
-- 20:03 — 每日新聞摘要（/news-summary skill）
+- 19:15 — YT 逐字稿精華摘要（處理「今天」日期）
+- 20:03 — 每日新聞摘要（處理「昨天」日期）
 
 認證方式：Max/Pro 訂閱（透過 ~/.claude/ 憑證）。
+
+重要：本排程器**直接餵完整 prompt** 給 Agent SDK，不再以 ``/skill`` slash
+觸發。原因是 `/news-summary`、`/yt-summary` 兩個 skill 已不存在於系統，
+`query(prompt="/news-summary")` 只會回 ``Unknown skill`` 並以 ``is_error=False``
+立即結束（假成功、$0.0000、無產出）。改餵完整 prompt 後，並以「實際產出檔案」
+作為成功判準（產出防呆），避免再次空跑卻記成完成。
 """
 
 import asyncio
@@ -15,20 +21,13 @@ from datetime import datetime
 from pathlib import Path
 
 import schedule as schedule_lib
-from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
+
+import summaries
 
 # 路徑設定
-BASE_DIR = Path(__file__).parent
+BASE_DIR = Path(__file__).resolve().parent
 LOG_DIR = BASE_DIR / "logs"
 LOG_DIR.mkdir(exist_ok=True)
-
-# Claude Code 工作目錄（skill 定義與檔案路徑皆基於此）
-CLAUDE_CWD = str(BASE_DIR.parent)
-
-# 允許的工具（與原 crontab 的 --allowedTools 一致）
-ALLOWED_TOOLS = [
-    "Bash", "Read", "Write", "Glob", "Grep", "Edit", "Skill",
-]
 
 logger = logging.getLogger("ai_scheduler")
 
@@ -52,69 +51,47 @@ def setup_logging():
     logger.addHandler(stream_handler)
 
 
-def _build_options() -> ClaudeAgentOptions:
-    """建立 Agent SDK 選項。"""
-    return ClaudeAgentOptions(
-        allowed_tools=ALLOWED_TOOLS,
-        permission_mode="acceptEdits",
-        cwd=CLAUDE_CWD,
-    )
-
-
-async def _run_skill(skill_name: str) -> dict:
-    """執行指定的 Claude Code skill。
+def _run_summary_sync(task_label: str, prompt: str, output_path: Path):
+    """同步執行一次摘要任務，並以「實際產出檔案」作為成功判準。
 
     Args:
-        skill_name: skill 名稱（如 "/yt-summary"）。
-
-    Returns:
-        dict: 包含 result、cost、is_error 欄位。
-    """
-    result_data = {
-        "result": None,
-        "cost": None,
-        "is_error": False,
-    }
-
-    async for message in query(
-        prompt=skill_name, options=_build_options()
-    ):
-        if isinstance(message, ResultMessage):
-            result_data["result"] = message.result
-            result_data["cost"] = message.total_cost_usd
-            result_data["is_error"] = bool(message.is_error)
-
-    return result_data
-
-
-def _run_skill_sync(skill_name: str, task_label: str):
-    """同步包裝 async skill 執行（供 schedule callback 使用）。
-
-    Args:
-        skill_name: skill 名稱（如 "/yt-summary"）。
         task_label: 任務標籤（用於 log）。
+        prompt: 餵給 SDK 的完整 prompt。
+        output_path: 預期輸出檔路徑；任務後若未被建立／更新即記為 ERROR。
     """
     logger.info("排程觸發：%s", task_label)
     start = datetime.now()
+    start_ts = time.time()
 
     try:
         loop = asyncio.new_event_loop()
         try:
-            result = loop.run_until_complete(_run_skill(skill_name))
+            result = loop.run_until_complete(summaries.run_prompt(prompt))
         finally:
             loop.close()
 
         elapsed = (datetime.now() - start).total_seconds()
+        produced = summaries.output_is_fresh(output_path, start_ts)
 
         if result["is_error"]:
+            # SDK 自身回報錯誤
             logger.error(
-                "%s 失敗（%.1f 秒）：%s",
+                "%s 失敗（%.1f 秒）：SDK is_error，result=%s",
                 task_label, elapsed, result["result"],
             )
+        elif not produced:
+            # 產出防呆：SDK 看似完成但預期檔案未產出（含空跑情形）
+            logger.error(
+                "%s 失敗（%.1f 秒）：預期輸出檔未產出 %s（result=%s，cost=$%.4f）",
+                task_label, elapsed, output_path,
+                result["result"], result["cost"] or 0,
+            )
         else:
+            size = output_path.stat().st_size
             logger.info(
-                "%s 完成（%.1f 秒），花費 $%.4f",
-                task_label, elapsed, result["cost"] or 0,
+                "%s 完成（%.1f 秒），產出 %s（%d bytes），花費 $%.4f",
+                task_label, elapsed, output_path.name, size,
+                result["cost"] or 0,
             )
 
     except Exception:
@@ -123,13 +100,38 @@ def _run_skill_sync(skill_name: str, task_label: str):
 
 
 def job_yt_summary():
-    """YT 精華摘要排程任務。"""
-    _run_skill_sync("/yt-summary", "YT 精華摘要")
+    """YT 精華摘要排程任務（處理今天日期）。"""
+    date_str = summaries.yt_summary_date()
+    label = f"YT 精華摘要（{date_str}）"
+    if not summaries.yt_source_available(date_str):
+        # 無逐字稿來源 → 略過（不空跑、不誤判為失敗）
+        logger.warning(
+            "%s 略過：找不到逐字稿來源 %s",
+            label, summaries.yt_source_path(date_str),
+        )
+        return
+    _run_summary_sync(
+        label,
+        summaries.build_yt_prompt(date_str),
+        summaries.yt_output_path(date_str),
+    )
 
 
 def job_news_summary():
-    """每日新聞摘要排程任務。"""
-    _run_skill_sync("/news-summary", "每日新聞摘要")
+    """每日新聞摘要排程任務（處理昨天日期）。"""
+    date_str = summaries.news_summary_date()
+    label = f"每日新聞摘要（{date_str}）"
+    if not summaries.news_sources_available(date_str):
+        logger.warning(
+            "%s 略過：四個新聞來源於 %s 皆無檔案",
+            label, date_str,
+        )
+        return
+    _run_summary_sync(
+        label,
+        summaries.build_news_prompt(date_str),
+        summaries.news_output_path(date_str),
+    )
 
 
 def setup_schedule():
@@ -144,7 +146,7 @@ def main():
     setup_logging()
     logger.info("=" * 50)
     logger.info("台股 AI 摘要排程器啟動")
-    logger.info("工作目錄：%s", CLAUDE_CWD)
+    logger.info("工作目錄：%s", summaries.WORKSPACE)
     logger.info("=" * 50)
 
     setup_schedule()
