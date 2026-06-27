@@ -4,16 +4,23 @@
 
 ## 功能說明
 
-- **YT 精華摘要**（每日 19:15）：呼叫 `/yt-summary` skill，讀取游庭皓的財經皓角逐字稿並產生精華摘要
-- **每日新聞摘要**（每日 20:03）：呼叫 `/news-summary` skill，查詢 MySQL 新聞資料並產生每日新聞摘要
+- **YT 精華摘要**（每日 19:15，處理今天日期）：讀取游庭皓的財經皓角逐字稿，直接餵完整 prompt 給 Agent SDK 產生精華摘要
+- **每日新聞摘要**（每日 20:03，處理昨天日期）：讀取四來源新聞全文，直接餵完整 prompt 給 Agent SDK 產生每日新聞摘要
+
+> **設計重點（直接餵 prompt + 產出防呆）**：早期版本以 `query(prompt="/yt-summary")`
+> 觸發 slash skill，但該 skill 已不存在於系統，SDK 只會回 `Unknown skill` 並以
+> `is_error=False` 立即結束（假成功、$0.0000、無產出）。現改為**直接餵完整 prompt**，
+> 並以**實際產出檔案**作為成功判準：任務後若預期輸出檔未被建立／更新即記為 ERROR，
+> 杜絕空跑卻記成完成。
 
 ## 架構
 
 ```
 Host macOS（conda env）
   └── ai_scheduler.py（schedule 主迴圈，背景 daemon）
-      ├── 19:15 → Agent SDK → /yt-summary skill
-      └── 20:03 → Agent SDK → /news-summary skill
+      ├── 19:15 → 檢查逐字稿來源 → Agent SDK（完整 prompt）→ 產出防呆
+      └── 20:03 → 檢查新聞來源   → Agent SDK（完整 prompt）→ 產出防呆
+          （prompt 組裝、來源檢查、產出防呆皆共用 summaries.py）
 
 認證：~/.claude/（Max/Pro 訂閱）
 工作目錄：本專案的上層目錄（Tw_stock/）
@@ -25,13 +32,34 @@ Host macOS（conda env）
 
 ```
 Tw_stock_ai_scheduler/
-├── ai_scheduler.py       # 主程式（schedule + Agent SDK）
-├── run.sh                # 啟動/停止/狀態腳本
-├── pyproject.toml        # Python 專案定義（PEP 621）
-├── requirements.txt      # 依賴
-├── logs/                 # 日誌資料夾
+├── ai_scheduler.py        # 主程式（schedule + 產出防呆）
+├── summaries.py           # 共用邏輯（prompt 組裝、日期、來源檢查、產出防呆、SDK 執行）
+├── batch_news_summary.py  # 批次補抓每日新聞摘要
+├── batch_yt_summary.py    # 批次補抓 YT 精華摘要
+├── run.sh                 # 啟動/停止/狀態腳本
+├── pyproject.toml         # Python 專案定義（PEP 621）
+├── requirements.txt       # 依賴
+├── test/                  # 單元測試（純函式，不真打 SDK）
+├── logs/                  # 日誌資料夾
 ├── .gitignore
 └── README.md
+```
+
+## 批次補抓
+
+```bash
+# 補抓每日新聞摘要區間（無來源的日子會自動略過並列出）
+python batch_news_summary.py 2026-06-10 2026-06-26
+
+# 補抓 YT 精華摘要區間（無逐字稿的日子會自動略過並列出）
+python batch_yt_summary.py 2026-06-10 2026-06-22
+```
+
+## 測試
+
+```bash
+pip install ".[dev]"   # 或 pip install pytest
+python -m pytest
 ```
 
 ## 使用方式
