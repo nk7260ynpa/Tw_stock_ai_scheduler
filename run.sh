@@ -82,9 +82,10 @@ case "${1:-start}" in
     ;;
 
   restart)
-    "${BASH_SOURCE[0]}" stop
+    # 以絕對路徑呼叫自身，避免相對檔名不在 PATH 造成 command not found
+    bash "${SCRIPT_DIR}/run.sh" stop
     sleep 1
-    "${BASH_SOURCE[0]}" start
+    bash "${SCRIPT_DIR}/run.sh" start
     ;;
 
   *)
