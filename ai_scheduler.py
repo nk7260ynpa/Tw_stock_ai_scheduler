@@ -1,8 +1,9 @@
 """台股 AI 摘要排程器。
 
 使用 Claude Agent SDK 搭配 schedule 套件，定期執行：
-- 19:15 — YT 逐字稿精華摘要（處理「今天」日期）
-- 20:03 — 每日新聞摘要（處理「昨天」日期）
+- YT 逐字稿精華摘要：**事件驅動輪詢**（每 ``YT_POLL_MINUTES`` 分鐘檢查一次，
+  處理「今天」日期）—— 今天逐字稿一出現且尚未產摘要就立即產生。
+- 20:03 — 每日新聞摘要（固定時刻，處理「昨天」日期）。
 
 認證方式：Max/Pro 訂閱（透過 ~/.claude/ 憑證）。
 
@@ -11,10 +12,15 @@
 `query(prompt="/news-summary")` 只會回 ``Unknown skill`` 並以 ``is_error=False``
 立即結束（假成功、$0.0000、無產出）。改餵完整 prompt 後，並以「實際產出檔案」
 作為成功判準（產出防呆），避免再次空跑卻記成完成。
+
+YT 改為輪詢的理由：固定 19:15 觸發過於脆弱——逐字稿延遲、或 daemon 該刻
+剛好沒在跑就整天錯過。改成每隔幾分鐘檢查今天逐字稿是否出現，出現且尚未
+產摘要就立即補產；搭配 launchd KeepAlive 守護，daemon 死掉會自動復活。
 """
 
 import asyncio
 import logging
+import os
 import sys
 import time
 from datetime import datetime
@@ -30,6 +36,17 @@ LOG_DIR = BASE_DIR / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 
 logger = logging.getLogger("ai_scheduler")
+
+# YT 精華摘要輪詢間隔（分鐘），可透過環境變數覆蓋。
+YT_POLL_MINUTES = int(os.environ.get("YT_POLL_MINUTES", "2"))
+
+# 同一日 YT 摘要最多嘗試產出的次數（失敗成本防護）。
+# 達上限後當日停止重試、只記一次 ERROR，隔日（date_str 改變）自動歸零。
+YT_MAX_DAILY_ATTEMPTS = 5
+
+# 記憶體內「每日嘗試次數」計數：{date_str: 次數}。
+# 僅保留當日鍵值（每次嘗試前清掉舊日鍵），故隨 daemon 常駐也不會無限增長。
+_yt_attempt_counts: dict[str, int] = {}
 
 
 def setup_logging():
@@ -98,22 +115,54 @@ def _run_summary_sync(task_label: str, prompt: str, output_path: Path):
         logger.exception("%s 發生例外（%.1f 秒）", task_label, elapsed)
 
 
-def job_yt_summary():
-    """YT 精華摘要排程任務（處理今天日期）。"""
-    date_str = summaries.yt_summary_date()
-    label = f"YT 精華摘要（{date_str}）"
+def job_yt_summary_poll():
+    """輪詢式 YT 精華摘要：今天逐字稿一出現且尚未產摘要就立即產生。
+
+    本任務每隔 ``YT_POLL_MINUTES`` 分鐘被觸發一次。為避免一天數百次輪詢洗版
+    log，下列兩種「正常未達條件」狀況一律**安靜 return、不記 log**：
+
+    - 該日摘要已存在（冪等）。
+    - 逐字稿尚未出現。
+
+    僅在真正嘗試產出時，才由 :func:`_run_summary_sync` 記錄。
+
+    失敗成本防護：以模組級 :data:`_yt_attempt_counts` 記錄同一日的嘗試次數，
+    達 :data:`YT_MAX_DAILY_ATTEMPTS` 後當日停止重試、只記一次 ERROR；隔日
+    （``date_str`` 改變）自動歸零。失敗時輸出檔不會被建立，下個 tick 會自然
+    重試（跨 tick 免費重試是優點），上限則防止持續失敗使 SDK 成本暴衝。
+    """
+    date_str = summaries.yt_summary_date()  # 今天
+    if summaries.yt_summary_already_exists(date_str):
+        return  # 冪等：已產生 → 安靜跳過（不記 log）
     if not summaries.yt_source_available(date_str):
-        # 無逐字稿來源 → 略過（不空跑、不誤判為失敗）
-        logger.warning(
-            "%s 略過：找不到逐字稿來源 %s",
-            label, summaries.yt_source_path(date_str),
-        )
-        return
+        return  # 逐字稿尚未出現 → 安靜跳過（不記 log）
+
+    label = f"YT 精華摘要（{date_str}）"
+
+    attempts = _yt_attempt_counts.get(date_str, 0)
+    if attempts >= YT_MAX_DAILY_ATTEMPTS:
+        return  # 已達當日上限（先前已記過一次 ERROR）→ 安靜跳過
+
+    # 僅保留當日計數，避免常駐期間 dict 無限增長；隔日舊鍵自然被清掉並歸零。
+    _yt_attempt_counts.clear()
+    _yt_attempt_counts[date_str] = attempts + 1
+
     _run_summary_sync(
         label,
         summaries.build_yt_prompt(date_str),
         summaries.yt_output_path(date_str),
     )
+
+    # 本次嘗試後仍未產出且剛好達上限 → 記一次 ERROR 提示當日停止重試。
+    # （後續 tick 會在上方上限檢查處安靜跳過，不再重複記錄。）
+    if (
+        not summaries.yt_summary_already_exists(date_str)
+        and _yt_attempt_counts[date_str] >= YT_MAX_DAILY_ATTEMPTS
+    ):
+        logger.error(
+            "%s 連續 %d 次嘗試仍未產出，今日停止重試（隔日自動歸零）",
+            label, YT_MAX_DAILY_ATTEMPTS,
+        )
 
 
 def job_news_summary():
@@ -134,10 +183,13 @@ def job_news_summary():
 
 
 def setup_schedule():
-    """設定每日排程。"""
-    schedule_lib.every().day.at("19:15").do(job_yt_summary)
+    """設定排程：YT 精華摘要改事件驅動輪詢、每日新聞摘要維持固定 20:03。"""
+    schedule_lib.every(YT_POLL_MINUTES).minutes.do(job_yt_summary_poll)
     schedule_lib.every().day.at("20:03").do(job_news_summary)
-    logger.info("排程已設定：YT 精華摘要 19:15、每日新聞摘要 20:03")
+    logger.info(
+        "排程已設定：YT 精華摘要輪詢（每 %d 分鐘）、每日新聞摘要 20:03",
+        YT_POLL_MINUTES,
+    )
 
 
 def main():

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tw-stock-ai-scheduler"
-version = "1.2.0"
+version = "1.3.0"
 description = "台股 AI 摘要排程器，使用 Claude Agent SDK 定期產生 YT 精華摘要與每日新聞摘要"
 requires-python = ">=3.12"
 license = "MIT"

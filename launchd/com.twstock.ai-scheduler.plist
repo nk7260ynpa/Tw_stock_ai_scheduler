@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  台股 AI 摘要排程器 LaunchAgent 設定。
+
+  必須以「LaunchAgent」安裝（~/Library/LaunchAgents/、使用者登入 session 載入），
+  才能存取 user Keychain 的 Max 訂閱憑證；**不可**改成 system LaunchDaemon。
+
+  RunAtLoad + KeepAlive 提供守護：開機載入即啟動，daemon 異常結束時自動復活。
+
+  ⚠️ 絕對不要在 EnvironmentVariables 加入 ANTHROPIC_API_KEY，
+     否則會覆蓋訂閱、改走 API 計費。
+
+  ProgramArguments 中的 python 路徑為 Torch conda 環境的預設值
+  (${CONDA_BASE:-$HOME/miniconda3}/envs/Torch/bin/python)；安裝時 run.sh 會依
+  CONDA_ENV / CONDA_BASE 覆寫此路徑（與 PATH 中對應的 conda bin 目錄），故毋須
+  手動修改本檔即可切換 conda 環境。
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.twstock.ai-scheduler</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/chen/miniconda3/envs/Torch/bin/python</string>
+        <string>/Users/chen/AI/Tw_stock/Tw_stock_ai_scheduler/ai_scheduler.py</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/chen/AI/Tw_stock</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/chen</string>
+        <key>PATH</key>
+        <string>/Users/chen/.local/bin:/Users/chen/miniconda3/envs/Torch/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>YT_POLL_MINUTES</key>
+        <string>2</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/chen/AI/Tw_stock/Tw_stock_ai_scheduler/logs/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/chen/AI/Tw_stock/Tw_stock_ai_scheduler/logs/launchd.err.log</string>
+</dict>
+</plist>
