@@ -17,7 +17,9 @@ PYTHON="${CONDA_BASE}/envs/${CONDA_ENV}/bin/python"
 
 # plist 中內建（預設）與本次推導的 conda bin 目錄；安裝時用後者覆寫前者，
 # 使 CONDA_ENV / CONDA_BASE 覆寫實際生效。
-DEFAULT_CONDA_BIN="${HOME}/miniconda3/envs/Torch/bin"
+# DEFAULT_CONDA_BIN 必須等於 committed plist 內硬編的字面路徑（而非 ${HOME} 推導），
+# 否則當 HOME 與 /Users/chen 不同時，sed 會找不到字串而無法改寫。
+DEFAULT_CONDA_BIN="/Users/chen/miniconda3/envs/Torch/bin"
 CONDA_BIN="${CONDA_BASE}/envs/${CONDA_ENV}/bin"
 
 LOG_DIR="${SCRIPT_DIR}/logs"
