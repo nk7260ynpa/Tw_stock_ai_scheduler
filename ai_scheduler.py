@@ -70,6 +70,39 @@ _news_attempt_counts: dict[str, int] = {}
 _news_nosource_warned: dict[str, bool] = {}
 
 
+def _parse_hhmm(value: str) -> dt_time:
+    """將 ``HH:MM`` 字串解析為 :class:`datetime.time`。"""
+    hour, minute = value.split(":")
+    return dt_time(int(hour), int(minute))
+
+
+def _resolve_ready_time(value: str) -> dt_time:
+    """解析就緒時刻字串，格式非法時 fallback 預設 20:03。
+
+    於模組載入時解析一次（環境變數本就只讀一次），避免每個 tick 重複解析；
+    更重要的是：非法值不會在輪詢 gate（位於主迴圈 ``run_pending`` 之外、
+    無 try/except）拋例外，導致 daemon 反覆崩潰、由 launchd KeepAlive 不停重啟。
+
+    Args:
+        value: ``HH:MM`` 字串（須零補位）。
+
+    Returns:
+        datetime.time: 解析結果；格式非法時回預設 20:03 並記 WARNING。
+    """
+    try:
+        return _parse_hhmm(value)
+    except (ValueError, TypeError):
+        logger.warning(
+            "NEWS_READY_TIME=%r 格式非法（需零補位 HH:MM），改用預設 20:03",
+            value,
+        )
+        return dt_time(20, 3)
+
+
+# 模組載入時解析一次就緒時刻（env var 本就只讀一次，避免每個 tick 重複解析）。
+_NEWS_READY_TIME = _resolve_ready_time(NEWS_READY_TIME)
+
+
 def setup_logging():
     """設定 logger，同時輸出至檔案與 stderr。"""
     logger.setLevel(logging.INFO)
@@ -186,21 +219,15 @@ def job_yt_summary_poll():
         )
 
 
-def _parse_hhmm(value: str) -> dt_time:
-    """將 ``HH:MM`` 字串解析為 :class:`datetime.time`。"""
-    hour, minute = value.split(":")
-    return dt_time(int(hour), int(minute))
-
-
 def _past_news_ready_time() -> bool:
-    """目前本地時間是否已達每日新聞就緒時刻 :data:`NEWS_READY_TIME`。
+    """目前本地時間是否已達每日新聞就緒時刻 :data:`_NEWS_READY_TIME`。
 
     抽成獨立函式以便單元測試 monkeypatch（避免依賴真實時鐘）。
 
     Returns:
-        bool: 現在時刻 >= ``NEWS_READY_TIME`` 則為 True。
+        bool: 現在時刻 >= 就緒時刻則為 True。
     """
-    return datetime.now().time() >= _parse_hhmm(NEWS_READY_TIME)
+    return datetime.now().time() >= _NEWS_READY_TIME
 
 
 def job_news_summary_poll():
@@ -276,7 +303,8 @@ def setup_schedule():
     logger.info(
         "排程已設定：YT 精華摘要輪詢（每 %d 分鐘）、"
         "每日新聞摘要輪詢（每 %d 分鐘，就緒時刻 %s）",
-        YT_POLL_MINUTES, NEWS_POLL_MINUTES, NEWS_READY_TIME,
+        YT_POLL_MINUTES, NEWS_POLL_MINUTES,
+        _NEWS_READY_TIME.strftime("%H:%M"),
     )
 
 

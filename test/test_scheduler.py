@@ -127,9 +127,23 @@ def test_parse_hhmm():
     assert ai_scheduler._parse_hhmm("08:00") == _dt.time(8, 0)
 
 
+def test_resolve_ready_time_valid():
+    """合法 HH:MM → 正確解析。"""
+    assert ai_scheduler._resolve_ready_time("20:03") == _dt.time(20, 3)
+
+
+def test_resolve_ready_time_falls_back_on_bad_value(caplog):
+    """非法值 → fallback 預設 20:03 並記 WARNING（不拋例外，避免 daemon 崩潰）。"""
+    with caplog.at_level(logging.WARNING, logger="ai_scheduler"):
+        for bad in ("2003", "20:03:00", "xx:yy", ""):
+            assert ai_scheduler._resolve_ready_time(bad) == _dt.time(20, 3)
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 4  # 每個非法值各警示一次
+
+
 def test_past_news_ready_time_gate(monkeypatch):
     """就緒時刻前回 False、之後回 True（以 monkeypatch datetime.now 控制）。"""
-    monkeypatch.setattr(ai_scheduler, "NEWS_READY_TIME", "20:03")
+    monkeypatch.setattr(ai_scheduler, "_NEWS_READY_TIME", _dt.time(20, 3))
 
     class _FixedDatetime(_dt.datetime):
         _now = None
