@@ -165,6 +165,23 @@ def news_sources_available(date_str: str) -> bool:
     return any(c > 0 for c in news_source_counts(date_str).values())
 
 
+def news_summary_already_exists(date_str: str) -> bool:
+    """該日每日新聞摘要是否已產出（冪等檢查，存在且非空才算）。
+
+    供事件驅動輪詢使用：摘要已存在即代表該日工作已完成，輪詢應安靜跳過，
+    不重複觸發 SDK、不重複記錄 log。與 :func:`yt_summary_already_exists`
+    對稱，只是檢查 DailyNews 輸出檔。
+
+    Args:
+        date_str: ``YYYY-MM-DD``。
+
+    Returns:
+        bool: 輸出檔存在且非空則為 True。
+    """
+    p = news_output_path(date_str)
+    return p.is_file() and p.stat().st_size > 0
+
+
 def yt_source_path(date_str: str) -> Path:
     """YT 逐字稿來源檔路徑。"""
     return NEWS_SOURCE_ROOT / "YT" / date_str / f"{date_str}.md"
