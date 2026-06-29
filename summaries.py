@@ -176,6 +176,22 @@ def yt_source_available(date_str: str) -> bool:
     return p.is_file() and p.stat().st_size > 0
 
 
+def yt_summary_already_exists(date_str: str) -> bool:
+    """該日 YT 精華摘要是否已產出（冪等檢查，存在且非空才算）。
+
+    供事件驅動輪詢使用：摘要已存在即代表今日工作已完成，輪詢應安靜跳過，
+    不重複觸發 SDK、不重複記錄 log。
+
+    Args:
+        date_str: ``YYYY-MM-DD``。
+
+    Returns:
+        bool: 輸出檔存在且非空則為 True。
+    """
+    p = yt_output_path(date_str)
+    return p.is_file() and p.stat().st_size > 0
+
+
 # ── Prompt 組裝 ─────────────────────────────────────────────────────────
 def build_news_prompt(date_str: str) -> str:
     """組裝每日新聞摘要的完整 prompt（直接餵給 SDK，不走 slash skill）。"""
