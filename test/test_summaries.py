@@ -174,6 +174,27 @@ def test_yt_summary_already_exists_true_when_present(tmp_path, monkeypatch):
     assert summaries.yt_summary_already_exists("2026-06-29") is True
 
 
+# ── 每日新聞摘要冪等檢查 news_summary_already_exists ────────────────────────
+def test_news_summary_already_exists_false_when_missing(tmp_path, monkeypatch):
+    """輸出檔不存在 → False。"""
+    monkeypatch.setattr(summaries, "NEWS_OUTPUT_DIR", tmp_path)
+    assert summaries.news_summary_already_exists("2026-06-28") is False
+
+
+def test_news_summary_already_exists_false_when_empty(tmp_path, monkeypatch):
+    """輸出檔存在但為空 → False。"""
+    monkeypatch.setattr(summaries, "NEWS_OUTPUT_DIR", tmp_path)
+    (tmp_path / "2026-06-28.md").touch()  # 空檔
+    assert summaries.news_summary_already_exists("2026-06-28") is False
+
+
+def test_news_summary_already_exists_true_when_present(tmp_path, monkeypatch):
+    """輸出檔存在且非空 → True。"""
+    monkeypatch.setattr(summaries, "NEWS_OUTPUT_DIR", tmp_path)
+    (tmp_path / "2026-06-28.md").write_text("# 摘要", encoding="utf-8")
+    assert summaries.news_summary_already_exists("2026-06-28") is True
+
+
 # ── Prompt 組裝 ─────────────────────────────────────────────────────────
 def test_build_news_prompt_contains_key_parts():
     p = summaries.build_news_prompt("2026-06-26")
