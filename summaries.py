@@ -3,7 +3,7 @@
 本模組由 daemon（`ai_scheduler.py`）與批次補抓腳本
 （`batch_news_summary.py`、`batch_yt_summary.py`）共用，集中：
 
-- 兩種摘要的「日期邏輯」（新聞用昨天、YT 用今天）。
+- 兩種摘要的「日期邏輯」（新聞、YT 皆用昨天；見 :func:`yt_summary_date` 說明）。
 - 直接餵給 Claude Agent SDK 的「完整 prompt」組裝（不再依賴 `/skill` slash 觸發）。
 - 預期輸出檔路徑與「產出防呆」判斷（以實際產出檔案為成功判準）。
 - 來源資料是否存在的檢查（無來源就略過、不空跑）。
@@ -67,16 +67,23 @@ def news_summary_date(today: date | None = None) -> str:
 
 
 def yt_summary_date(today: date | None = None) -> str:
-    """回傳 YT 精華摘要要處理的日期（今天），格式 ``YYYY-MM-DD``。
+    """回傳 YT 精華摘要要處理的日期（昨天），格式 ``YYYY-MM-DD``。
+
+    **為何是昨天（2026-07 時序調整）**：游庭皓的「早晨財經速解讀」為晨間節目，
+    約 08:30（開盤前半小時）才開播；上游 ``Tw_stock_DB_Operating`` 的 YT 逐字稿
+    抓取已移到早上約 07:54，此刻**今天**的節目尚未開播，抓到的必然是**昨天**已
+    完成的那集。上游以「影片上傳日 == 目標日期」比對並存成 ``YT/{目標日期}/``，
+    故 07:54 落檔的逐字稿會放在**昨天日期**的資料夾。因此本排程器改為處理昨天，
+    與 :func:`news_summary_date` 對齊（皆為「今天早上產出昨天的摘要」）。
 
     Args:
         today: 基準日期，預設為今天（便於測試注入）。
 
     Returns:
-        str: 今天的日期字串。
+        str: 昨天的日期字串。
     """
     today = today or date.today()
-    return today.strftime("%Y-%m-%d")
+    return (today - timedelta(days=1)).strftime("%Y-%m-%d")
 
 
 def date_range(start_date: str, end_date: str) -> list[str]:

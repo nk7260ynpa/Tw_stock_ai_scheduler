@@ -27,9 +27,20 @@ def test_news_summary_date_crosses_month():
     assert summaries.news_summary_date(date(2026, 7, 1)) == "2026-06-30"
 
 
-def test_yt_summary_date_is_today():
-    """YT 摘要用今天。"""
-    assert summaries.yt_summary_date(date(2026, 6, 27)) == "2026-06-27"
+def test_yt_summary_date_is_yesterday():
+    """YT 摘要用昨天（晨間節目約 08:30 才播，07:54 抓到的是昨天那集）。"""
+    assert summaries.yt_summary_date(date(2026, 6, 27)) == "2026-06-26"
+
+
+def test_yt_summary_date_crosses_month():
+    """YT 昨天邏輯跨月邊界正確。"""
+    assert summaries.yt_summary_date(date(2026, 7, 1)) == "2026-06-30"
+
+
+def test_summary_dates_cross_year():
+    """跨年邊界：元旦當天，新聞與 YT 皆回前一年最後一天。"""
+    assert summaries.news_summary_date(date(2027, 1, 1)) == "2026-12-31"
+    assert summaries.yt_summary_date(date(2027, 1, 1)) == "2026-12-31"
 
 
 def test_weekday_zh():

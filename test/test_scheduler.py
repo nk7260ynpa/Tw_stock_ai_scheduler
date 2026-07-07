@@ -129,21 +129,21 @@ def test_parse_hhmm():
 
 def test_resolve_ready_time_valid():
     """合法 HH:MM → 正確解析。"""
-    assert ai_scheduler._resolve_ready_time("20:03") == _dt.time(20, 3)
+    assert ai_scheduler._resolve_ready_time("08:00") == _dt.time(8, 0)
 
 
 def test_resolve_ready_time_falls_back_on_bad_value(caplog):
-    """非法值 → fallback 預設 20:03 並記 WARNING（不拋例外，避免 daemon 崩潰）。"""
+    """非法值 → fallback 預設 08:00 並記 WARNING（不拋例外，避免 daemon 崩潰）。"""
     with caplog.at_level(logging.WARNING, logger="ai_scheduler"):
-        for bad in ("2003", "20:03:00", "xx:yy", ""):
-            assert ai_scheduler._resolve_ready_time(bad) == _dt.time(20, 3)
+        for bad in ("0800", "08:00:00", "xx:yy", ""):
+            assert ai_scheduler._resolve_ready_time(bad) == _dt.time(8, 0)
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 4  # 每個非法值各警示一次
 
 
 def test_past_news_ready_time_gate(monkeypatch):
     """就緒時刻前回 False、之後回 True（以 monkeypatch datetime.now 控制）。"""
-    monkeypatch.setattr(ai_scheduler, "_NEWS_READY_TIME", _dt.time(20, 3))
+    monkeypatch.setattr(ai_scheduler, "_NEWS_READY_TIME", _dt.time(8, 0))
 
     class _FixedDatetime(_dt.datetime):
         _now = None
@@ -152,13 +152,13 @@ def test_past_news_ready_time_gate(monkeypatch):
         def now(cls, tz=None):
             return cls._now
 
-    # 就緒時刻之前
-    _FixedDatetime._now = _dt.datetime(2026, 6, 29, 19, 0)
+    # 就緒時刻之前（新聞尚未於早上 07:46–07:52 落檔完成）
+    _FixedDatetime._now = _dt.datetime(2026, 6, 29, 7, 30)
     monkeypatch.setattr(ai_scheduler, "datetime", _FixedDatetime)
     assert ai_scheduler._past_news_ready_time() is False
 
-    # 就緒時刻之後
-    _FixedDatetime._now = _dt.datetime(2026, 6, 29, 21, 9)
+    # 就緒時刻之後（08:00 後四來源皆已落檔）
+    _FixedDatetime._now = _dt.datetime(2026, 6, 29, 8, 15)
     assert ai_scheduler._past_news_ready_time() is True
 
 
