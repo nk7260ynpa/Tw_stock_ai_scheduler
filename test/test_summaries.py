@@ -37,6 +37,12 @@ def test_yt_summary_date_crosses_month():
     assert summaries.yt_summary_date(date(2026, 7, 1)) == "2026-06-30"
 
 
+def test_summary_dates_cross_year():
+    """跨年邊界：元旦當天，新聞與 YT 皆回前一年最後一天。"""
+    assert summaries.news_summary_date(date(2027, 1, 1)) == "2026-12-31"
+    assert summaries.yt_summary_date(date(2027, 1, 1)) == "2026-12-31"
+
+
 def test_weekday_zh():
     """中文星期換算（2026-06-26 為週五）。"""
     assert summaries._weekday_zh("2026-06-26") == "週五"
