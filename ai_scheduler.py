@@ -3,10 +3,10 @@
 使用 Claude Agent SDK 搭配 schedule 套件，定期執行（兩種摘要皆改為
 **事件驅動／冪等補產的輪詢**，不再依賴單一固定時刻）：
 
-- YT 逐字稿精華摘要：每 ``YT_POLL_MINUTES`` 分鐘檢查一次（處理「今天」日期）——
-  今天逐字稿一出現且尚未產摘要就立即產生。
+- YT 逐字稿精華摘要：每 ``YT_POLL_MINUTES`` 分鐘檢查一次（處理「昨天」日期）——
+  昨天的逐字稿一出現且尚未產摘要就立即產生（來源可用性即為天然閘門，不設時刻）。
 - 每日新聞摘要：每 ``NEWS_POLL_MINUTES`` 分鐘檢查一次（處理「昨天」日期）——
-  到達當日「新聞就緒時刻」(``NEWS_READY_TIME``，預設 20:03) 後，昨天的摘要若
+  到達當日「新聞就緒時刻」(``NEWS_READY_TIME``，預設 08:00) 後，昨天的摘要若
   尚未產出就立即補產。
 
 認證方式：Max/Pro 訂閱（透過 ~/.claude/ 憑證）。
@@ -21,8 +21,13 @@
 或 daemon 該刻剛好沒在跑就整天錯過（``schedule`` 遇錯過的時刻會直接跳到隔天）。
 改成每隔幾分鐘檢查，條件達成且尚未產出就立即補產（catch-up）；搭配 launchd
 KeepAlive 守護，daemon 死掉會自動復活。新聞摘要另以 ``NEWS_READY_TIME`` 為
-「就緒時刻」下限，確保四來源（當晚 21:00–22:30 上傳、隔日 06:30 重排）皆已
-落檔，維持與原固定 20:03 相同的來源完整度。
+「就緒時刻」下限，確保四來源皆已落檔才產出。
+
+時序（2026-07 起，上游抓取已由晚上移到早上）：新聞四來源約於當日早上
+07:46–07:52、YT 逐字稿約於 07:54 抓取落檔（皆為「昨天」的資料），契約為
+08:00 前全部完成。故 ``NEWS_READY_TIME`` 由 20:03 改為 08:00，兩種摘要皆於
+「今天早上」產出「昨天」的摘要（YT 日期改為昨天的緣由見
+:func:`summaries.yt_summary_date`）。
 """
 
 import asyncio
@@ -52,9 +57,10 @@ YT_POLL_MINUTES = int(os.environ.get("YT_POLL_MINUTES", "2"))
 NEWS_POLL_MINUTES = int(os.environ.get("NEWS_POLL_MINUTES", "5"))
 
 # 每日新聞「就緒時刻」(HH:MM)：此刻之前不嘗試產出昨天的摘要。
-# 確保四來源（當晚 21:00–22:30 上傳、隔日 06:30 重排）皆已落檔，維持與原固定
-# 20:03 相同的來源完整度。可透過環境變數覆蓋（須為零補位的 HH:MM）。
-NEWS_READY_TIME = os.environ.get("NEWS_READY_TIME", "20:03")
+# 上游抓取已改早上時序（新聞四來源約 07:46–07:52 落檔，契約 08:00 前全部完成），
+# 故就緒時刻設 08:00，確保四來源皆已落檔才產出。可透過環境變數覆蓋（須為零補位
+# 的 HH:MM）。
+NEWS_READY_TIME = os.environ.get("NEWS_READY_TIME", "08:00")
 
 # 同一日摘要最多嘗試產出的次數（失敗成本防護）。
 # 達上限後當日停止重試、只記一次 ERROR，隔日（date_str 改變）自動歸零。
@@ -77,7 +83,7 @@ def _parse_hhmm(value: str) -> dt_time:
 
 
 def _resolve_ready_time(value: str) -> dt_time:
-    """解析就緒時刻字串，格式非法時 fallback 預設 20:03。
+    """解析就緒時刻字串，格式非法時 fallback 預設 08:00。
 
     於模組載入時解析一次（環境變數本就只讀一次），避免每個 tick 重複解析；
     更重要的是：非法值不會在輪詢 gate（位於主迴圈 ``run_pending`` 之外、
@@ -87,16 +93,16 @@ def _resolve_ready_time(value: str) -> dt_time:
         value: ``HH:MM`` 字串（須零補位）。
 
     Returns:
-        datetime.time: 解析結果；格式非法時回預設 20:03 並記 WARNING。
+        datetime.time: 解析結果；格式非法時回預設 08:00 並記 WARNING。
     """
     try:
         return _parse_hhmm(value)
     except (ValueError, TypeError):
         logger.warning(
-            "NEWS_READY_TIME=%r 格式非法（需零補位 HH:MM），改用預設 20:03",
+            "NEWS_READY_TIME=%r 格式非法（需零補位 HH:MM），改用預設 08:00",
             value,
         )
-        return dt_time(20, 3)
+        return dt_time(8, 0)
 
 
 # 模組載入時解析一次就緒時刻（env var 本就只讀一次，避免每個 tick 重複解析）。
@@ -170,10 +176,16 @@ def _run_summary_sync(task_label: str, prompt: str, output_path: Path):
 
 
 def job_yt_summary_poll():
-    """輪詢式 YT 精華摘要：今天逐字稿一出現且尚未產摘要就立即產生。
+    """輪詢式 YT 精華摘要：昨天的逐字稿一出現且尚未產摘要就立即產生。
 
-    本任務每隔 ``YT_POLL_MINUTES`` 分鐘被觸發一次。為避免一天數百次輪詢洗版
-    log，下列兩種「正常未達條件」狀況一律**安靜 return、不記 log**：
+    本任務每隔 ``YT_POLL_MINUTES`` 分鐘被觸發一次，**全天候輪詢、不設就緒時刻**：
+    上游約於當日早上 07:54 才落檔昨天的逐字稿，故 07:54 前
+    :func:`summaries.yt_source_available` 自然回 False 而安靜跳過，逐字稿一出現
+    下個 tick 即產出——「來源可用性」本身即為天然閘門，毋須額外時刻 gate。
+    （日期改為昨天的緣由見 :func:`summaries.yt_summary_date`。）
+
+    為避免一天數百次輪詢洗版 log，下列兩種「正常未達條件」狀況一律
+    **安靜 return、不記 log**：
 
     - 該日摘要已存在（冪等）。
     - 逐字稿尚未出現。
@@ -185,7 +197,7 @@ def job_yt_summary_poll():
     （``date_str`` 改變）自動歸零。失敗時輸出檔不會被建立，下個 tick 會自然
     重試（跨 tick 免費重試是優點），上限則防止持續失敗使 SDK 成本暴衝。
     """
-    date_str = summaries.yt_summary_date()  # 今天
+    date_str = summaries.yt_summary_date()  # 昨天
     if summaries.yt_summary_already_exists(date_str):
         return  # 冪等：已產生 → 安靜跳過（不記 log）
     if not summaries.yt_source_available(date_str):
@@ -234,9 +246,9 @@ def job_news_summary_poll():
     """輪詢式每日新聞摘要：昨天的摘要缺漏即補產（冪等、可 catch-up）。
 
     本任務每隔 :data:`NEWS_POLL_MINUTES` 分鐘被觸發一次，與 YT 輪詢同構，
-    解決「daemon 在固定 20:03 沒活著、或啟動時已過 20:03」就整天靜默漏掉的
-    根因——只要 daemon 於當日就緒時刻後仍存活，下一個 tick 就會把昨天的摘要
-    補出來。
+    解決「daemon 在固定就緒時刻沒活著、或啟動時已過就緒時刻」就整天靜默漏掉的
+    根因——只要 daemon 於當日就緒時刻（預設 08:00）後仍存活，下一個 tick 就會
+    把昨天的摘要補出來。
 
     為避免一天數十次輪詢洗版 log，下列「正常未達條件」狀況一律**安靜 return**：
 

@@ -4,8 +4,15 @@
 
 ## 功能說明
 
-- **YT 精華摘要**（**事件驅動輪詢**，處理今天日期）：每 `YT_POLL_MINUTES` 分鐘（預設 2 分鐘）檢查一次今天逐字稿是否出現，出現且尚未產摘要就立即讀取游庭皓的財經皓角逐字稿，直接餵完整 prompt 給 Agent SDK 產生精華摘要
-- **每日新聞摘要**（**冪等補產輪詢**，處理昨天日期）：每 `NEWS_POLL_MINUTES` 分鐘（預設 5 分鐘）輪詢，到達當日就緒時刻 `NEWS_READY_TIME`（預設 20:03）後，昨天的摘要若尚未產出就讀取四來源新聞全文、直接餵完整 prompt 給 Agent SDK 補產
+- **YT 精華摘要**（**事件驅動輪詢**，處理昨天日期）：每 `YT_POLL_MINUTES` 分鐘（預設 2 分鐘）**全天候**檢查一次昨天逐字稿是否出現，出現且尚未產摘要就立即讀取游庭皓的財經皓角逐字稿，直接餵完整 prompt 給 Agent SDK 產生精華摘要
+- **每日新聞摘要**（**冪等補產輪詢**，處理昨天日期）：每 `NEWS_POLL_MINUTES` 分鐘（預設 5 分鐘）輪詢，到達當日就緒時刻 `NEWS_READY_TIME`（預設 08:00）後，昨天的摘要若尚未產出就讀取四來源新聞全文、直接餵完整 prompt 給 Agent SDK 補產
+
+> **時序（2026-07 起，上游抓取移到早上）**：上游 `Tw_stock_DB_Operating` 已把新聞與
+> YT 抓取由晚上移到早上並集中於 07:30–08:00——新聞四來源約 07:46–07:52、YT 逐字稿約
+> 07:54 落檔（皆為「昨天」的資料），契約為 08:00 前全部完成。故 `NEWS_READY_TIME` 由
+> 20:03 改為 **08:00**，且 **YT 日期由今天改為昨天**：游庭皓的「早晨財經速解讀」約
+> 08:30（開盤前半小時）才開播，07:54 抓到的必然是**昨天**那集，且上游存成
+> `YT/{昨天}/` 資料夾。兩種摘要皆於「今天早上」產出「昨天」的摘要。
 
 > **為何兩種摘要都改輪詢**：固定單一時刻觸發過於脆弱——資料延遲、或 daemon 該刻
 > 剛好沒在跑就整天錯過（`schedule` 遇錯過的時刻會直接跳到隔天）。改成每隔幾分鐘
@@ -15,11 +22,13 @@
 > tick 會自動重試；另設**每日嘗試上限**（同一日最多 5 次 SDK 嘗試，達上限只記一次
 > ERROR 並停止重試、隔日歸零）防止持續失敗使成本暴衝。
 >
-> 每日新聞摘要另以 `NEWS_READY_TIME`（預設 20:03）為「就緒時刻」下限，確保四來源
-> （當晚 21:00–22:30 上傳、隔日 06:30 重排）皆已落檔才產出，維持與原固定 20:03 相同
-> 的來源完整度；daemon 啟動時即做一次 catch-up，故「啟動已過 20:03」的當日缺漏會在
-> 啟動幾秒內補上，而非等到隔天。此輪詢僅補「昨天」一天，若 daemon 整天死掉漏掉某日，
-> 仍須以 `batch_news_summary.py` 手動補產。
+> YT 精華摘要**全天候輪詢、不設就緒時刻**：逐字稿約 07:54 才落檔，07:54 前來源檢查
+> 自然回 False 而安靜跳過，逐字稿一出現下個 tick 即產出（來源可用性即天然閘門）。
+> 每日新聞摘要則另以 `NEWS_READY_TIME`（預設 08:00）為「就緒時刻」下限，確保四來源
+> （早上 07:46–07:52 落檔）皆已落檔才產出，維持來源完整度；daemon 啟動時即做一次
+> catch-up，故「啟動已過就緒時刻」的當日缺漏會在啟動幾秒內補上，而非等到隔天。
+> 此輪詢僅補「昨天」一天，若 daemon 整天死掉漏掉某日，仍須以 `batch_news_summary.py`
+> 手動補產。
 
 > **設計重點（直接餵 prompt + 產出防呆）**：早期版本以 `query(prompt="/yt-summary")`
 > 觸發 slash skill，但該 skill 已不存在於系統，SDK 只會回 `Unknown skill` 並以
@@ -33,8 +42,8 @@
 launchd LaunchAgent（RunAtLoad + KeepAlive，死掉自動復活）
   └── Host macOS（conda env）
       └── ai_scheduler.py（schedule 主迴圈，背景 daemon；啟動即 catch-up sweep）
-          ├── YT 每 N 分鐘 → 冪等檢查 + 逐字稿來源檢查 → Agent SDK（完整 prompt）→ 產出防呆
-          └── 新聞 每 M 分鐘 → 就緒時刻(20:03)後 + 冪等檢查 + 新聞來源檢查 → Agent SDK（完整 prompt）→ 產出防呆
+          ├── YT 每 N 分鐘（全天候）→ 冪等檢查 + 逐字稿來源檢查(昨天) → Agent SDK（完整 prompt）→ 產出防呆
+          └── 新聞 每 M 分鐘 → 就緒時刻(08:00)後 + 冪等檢查 + 新聞來源檢查(昨天) → Agent SDK（完整 prompt）→ 產出防呆
               （prompt 組裝、來源檢查、冪等檢查、產出防呆皆共用 summaries.py）
 
 認證：~/.claude/（Max/Pro 訂閱，憑證在 user Keychain）
@@ -193,19 +202,18 @@ YT_POLL_MINUTES=5 bash run.sh start
 ### 每日新聞輪詢間隔與就緒時刻
 
 每日新聞摘要的輪詢間隔（分鐘）與就緒時刻可分別由 `NEWS_POLL_MINUTES`（預設 5）
-與 `NEWS_READY_TIME`（HH:MM，預設 20:03）覆蓋。兩者為程式內預設值，daemon 直接讀取
+與 `NEWS_READY_TIME`（HH:MM，預設 08:00）覆蓋。兩者為程式內預設值，daemon 直接讀取
 即生效；若要對 launchd daemon 覆寫，請自行加入 plist 的 `EnvironmentVariables`
 （`run.sh` 目前僅以 sed 注入 `YT_POLL_MINUTES` 與 conda 路徑，未注入這兩個變數）：
 
 ```bash
 # 直接執行（非 launchd）時可用環境變數覆蓋
-NEWS_POLL_MINUTES=10 NEWS_READY_TIME=20:30 python ai_scheduler.py
+NEWS_POLL_MINUTES=10 NEWS_READY_TIME=08:30 python ai_scheduler.py
 ```
 
-> `NEWS_READY_TIME` 之前不會嘗試產出昨天的摘要，確保四來源（當晚 21:00–22:30 上傳、
-> 隔日 06:30 重排）皆已落檔，維持與原固定 20:03 相同的來源完整度。其值於模組載入時
-> 解析一次；若格式非法（非零補位 HH:MM）會記一次 WARNING 並 fallback 預設 20:03，
-> 不會讓 daemon 崩潰。
+> `NEWS_READY_TIME` 之前不會嘗試產出昨天的摘要，確保四來源（早上 07:46–07:52 落檔）
+> 皆已落檔才產出，維持來源完整度。其值於模組載入時解析一次；若格式非法（非零補位
+> HH:MM）會記一次 WARNING 並 fallback 預設 08:00，不會讓 daemon 崩潰。
 
 ## 認證方式
 
