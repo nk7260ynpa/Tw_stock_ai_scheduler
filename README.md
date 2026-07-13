@@ -36,6 +36,17 @@
 > 並以**實際產出檔案**作為成功判準：任務後若預期輸出檔未被建立／更新即記為 ERROR，
 > 杜絕空跑卻記成完成。
 
+> **錯誤揭露與單次逾時（2026-07）**：Claude Agent SDK 預設**不擷取** CLI 子行程的
+> stderr，撞用量上限失敗時只會回寫死佔位字串「Check stderr output for details」，
+> 真正的 CLI 錯誤被吞掉。現於 `build_options()` 帶入 **stderr callback**，把 CLI
+> 原始 stderr 收進有界緩衝（最後 80 行）；`run_prompt()` 另擷取 SDK 的
+> **`RateLimitEvent`**（用量上限的權威訊號：`status`/`rate_limit_type`/`utilization`/
+> `resets_at`）與 `ResultMessage` 的 `stop_reason`/`errors`，任務失敗時一併寫入
+> `logs/ai_scheduler.log`，供定調是否為 Max 訂閱用量上限節流。此外每次 SDK 呼叫加上
+> **單次逾時**（`SDK_CALL_TIMEOUT_SEC`，預設 1200 秒＝20 分）：健康呼叫多為分鐘級，
+> 但撞用量上限時單次可 hang 數小時，逾時把單次上限壓到 20 分並終止 CLI 子行程
+> （不留孤兒行程），避免一次卡住吃掉整天。詳見「設定 → SDK 診斷與單次逾時」。
+
 ## 架構
 
 ```
@@ -214,6 +225,29 @@ NEWS_POLL_MINUTES=10 NEWS_READY_TIME=08:30 python ai_scheduler.py
 > `NEWS_READY_TIME` 之前不會嘗試產出昨天的摘要，確保四來源（早上 07:46–07:52 落檔）
 > 皆已落檔才產出，維持來源完整度。其值於模組載入時解析一次；若格式非法（非零補位
 > HH:MM）會記一次 WARNING 並 fallback 預設 08:00，不會讓 daemon 崩潰。
+
+### SDK 診斷與單次逾時
+
+兩個環境變數控制 SDK 呼叫的錯誤揭露與逾時（皆於 `summaries.py` 模組載入時讀取一次）：
+
+| 環境變數 | 預設 | 說明 |
+| --- | --- | --- |
+| `SDK_CALL_TIMEOUT_SEC` | `1200` | 單次 SDK 呼叫逾時（秒）。健康呼叫多為分鐘級，撞用量上限時單次可 hang 數小時；逾時把單次上限壓到 20 分並終止 CLI 子行程（`run_prompt` 於 `finally` 呼叫 async generator 的 `aclose()`，不留孤兒行程），走既有失敗/重試路徑。設 `<= 0` 停用逾時（不建議）。 |
+| `AI_SCHEDULER_SDK_DEBUG` | 關 | 設 `1`/`true`/`yes`/`on` 開啟 CLI 的 `--debug-to-stderr` 詳盡輸出（含 API 請求/回應、rate-limit 明細）到 stderr。量大故僅供排錯時開啟；平時不開亦能靠 stderr callback 捕獲真正的錯誤行。 |
+
+```bash
+# 直接執行（非 launchd）時可用環境變數覆蓋
+SDK_CALL_TIMEOUT_SEC=900 AI_SCHEDULER_SDK_DEBUG=1 python ai_scheduler.py
+```
+
+> 失敗時 `logs/ai_scheduler.log` 會多印 `rate_limit`（用量上限的權威訊號，來自 SDK 的
+> `RateLimitEvent`）、`stop_reason`、`errors` 與 **CLI stderr 尾段（最後 80 行）**，
+> 用以定調失敗根因是否為 Max 訂閱用量上限節流。此外 `claude_agent_sdk` 自身的 logger
+> 亦併入同一份檔案 log（如「Fatal error in message reader …」）。
+>
+> 兩者為程式內預設值，daemon 直接讀取即生效；若要對 launchd daemon 覆寫，需自行加入
+> plist 的 `EnvironmentVariables`（`run.sh` 目前僅以 sed 注入 `YT_POLL_MINUTES` 與
+> conda 路徑，未注入這兩個變數）。**切勿**在 plist 設 `ANTHROPIC_API_KEY`。
 
 ## 認證方式
 
