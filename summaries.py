@@ -460,6 +460,11 @@ async def run_summary_with_retry(
         start_ts = time.time()
         outcome["error"] = None
         outcome["is_error"] = False
+        # 每次嘗試前重置診斷欄位，避免逾時／例外時沿用前次嘗試的陳舊值。
+        outcome["stderr_tail"] = None
+        outcome["rate_limit"] = None
+        outcome["stop_reason"] = None
+        outcome["errors"] = None
         try:
             if timeout and timeout > 0:
                 result = await asyncio.wait_for(runner(prompt), timeout=timeout)

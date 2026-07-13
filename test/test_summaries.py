@@ -552,6 +552,32 @@ def test_run_prompt_collects_rate_limit_and_stop_reason(monkeypatch):
     assert agen.aclosed is True  # 顯式 aclose（孤兒行程防護）
 
 
+class _CancellingAgen:
+    """假 async generator：串流中途拋 CancelledError，並記錄是否 aclose。"""
+
+    def __init__(self):
+        self.aclosed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        raise asyncio.CancelledError()
+
+    async def aclose(self):
+        self.aclosed = True
+
+
+def test_run_prompt_reraises_cancelled_and_closes(monkeypatch):
+    """逾時取消（CancelledError）須外拋且仍 aclose CLI 子行程（孤兒防護核心路徑）。"""
+    agen = _CancellingAgen()
+    monkeypatch.setattr(summaries, "query", lambda **kw: agen)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(summaries.run_prompt("p"))
+    assert agen.aclosed is True  # 取消時仍終止子行程
+
+
 def test_run_prompt_captures_sdk_exception_without_propagating(monkeypatch):
     """SDK 串流拋例外（如 exit code 1）應收斂為 error、不外拋，並保留 stderr。"""
     agen = _FakeAgen(
