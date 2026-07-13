@@ -455,3 +455,211 @@ def test_summarize_backfill_all_ok_exit_zero():
         {"date": "d2", "status": "nosource", "cost": 0.0, "elapsed": 0.0},
     ]
     assert summaries.summarize_backfill(results, _log()) == 0
+
+
+# ── A1：build_options 的 stderr callback 與 debug 開關 ───────────────────
+def test_build_options_passes_stderr_callback():
+    """提供 stderr_callback 時應塞進 options.stderr（讓 SDK pipe CLI stderr）。"""
+    def cb(line):  # noqa: ANN001, D401
+        pass
+
+    opts = summaries.build_options(stderr_callback=cb)
+    assert opts.stderr is cb
+
+
+def test_build_options_default_no_stderr_and_no_debug(monkeypatch):
+    """預設不帶 callback、SDK_DEBUG 關 → stderr 為 None、無 debug-to-stderr。"""
+    monkeypatch.setattr(summaries, "SDK_DEBUG", False)
+    opts = summaries.build_options()
+    assert opts.stderr is None
+    assert "debug-to-stderr" not in (opts.extra_args or {})
+
+
+def test_build_options_debug_toggle_adds_extra_arg(monkeypatch):
+    """SDK_DEBUG 開 → extra_args 帶 debug-to-stderr，讓 CLI 輸出詳盡除錯。"""
+    monkeypatch.setattr(summaries, "SDK_DEBUG", True)
+    opts = summaries.build_options()
+    assert "debug-to-stderr" in (opts.extra_args or {})
+
+
+# ── A2：run_prompt 收集 rate-limit / stop_reason / stderr 尾段 ───────────
+class _FakeAgen:
+    """假 async generator：依序吐訊息，可選在收尾拋例外，並記錄是否 aclose。"""
+
+    def __init__(self, messages, *, raise_exc=None):
+        self._it = iter(messages)
+        self._raise_exc = raise_exc
+        self.aclosed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            return next(self._it)
+        except StopIteration:
+            if self._raise_exc is not None:
+                exc, self._raise_exc = self._raise_exc, None
+                raise exc
+            raise StopAsyncIteration
+
+    async def aclose(self):
+        self.aclosed = True
+
+
+def _fake_result_message(**kw):
+    from claude_agent_sdk import ResultMessage
+
+    defaults = dict(
+        subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
+        num_turns=1, session_id="s", stop_reason="end_turn",
+        total_cost_usd=0.5, result="DONE", errors=None,
+    )
+    defaults.update(kw)
+    return ResultMessage(**defaults)
+
+
+def _fake_rate_limit_event(**kw):
+    from claude_agent_sdk import RateLimitEvent, RateLimitInfo
+
+    info = RateLimitInfo(
+        status=kw.get("status", "rejected"),
+        rate_limit_type=kw.get("rate_limit_type", "five_hour"),
+        utilization=kw.get("utilization", 0.99),
+        resets_at=kw.get("resets_at", 1234567890),
+        overage_status=kw.get("overage_status", "disabled"),
+    )
+    return RateLimitEvent(rate_limit_info=info, uuid="u", session_id="s")
+
+
+def test_run_prompt_collects_rate_limit_and_stop_reason(monkeypatch):
+    """run_prompt 應從 RateLimitEvent / ResultMessage 收診斷欄位並 aclose。"""
+    agen = _FakeAgen([
+        _fake_rate_limit_event(status="rejected", utilization=0.99),
+        _fake_result_message(stop_reason="end_turn", errors=["boom"]),
+    ])
+    monkeypatch.setattr(summaries, "query", lambda **kw: agen)
+
+    data = asyncio.run(summaries.run_prompt("p"))
+
+    assert data["rate_limit"]["status"] == "rejected"
+    assert data["rate_limit"]["utilization"] == 0.99
+    assert data["rate_limit"]["rate_limit_type"] == "five_hour"
+    assert data["stop_reason"] == "end_turn"
+    assert data["errors"] == ["boom"]
+    assert data["result"] == "DONE"
+    assert data["is_error"] is False
+    assert agen.aclosed is True  # 顯式 aclose（孤兒行程防護）
+
+
+def test_run_prompt_captures_sdk_exception_without_propagating(monkeypatch):
+    """SDK 串流拋例外（如 exit code 1）應收斂為 error、不外拋，並保留 stderr。"""
+    agen = _FakeAgen(
+        [_fake_rate_limit_event(status="rejected")],
+        raise_exc=RuntimeError("Command failed with exit code 1"),
+    )
+    monkeypatch.setattr(summaries, "query", lambda **kw: agen)
+
+    data = asyncio.run(summaries.run_prompt("p"))  # 不應拋例外
+
+    assert data["is_error"] is True
+    assert data["error"] is not None and "exit code 1" in data["error"]
+    assert data["rate_limit"]["status"] == "rejected"  # 例外前已收到的資訊保留
+    assert data["stderr_tail"] == []  # 假 query 未觸發 stderr callback
+    assert agen.aclosed is True
+
+
+# ── B：run_summary_with_retry 單次呼叫逾時（含孤兒行程防護）───────────────
+def test_retry_times_out_and_cancels_runner(tmp_path):
+    """呼叫超過 call_timeout → 取消該次呼叫、記 timeout、視為失敗。"""
+    out = tmp_path / "o.md"
+    cancelled = {"yes": False}
+
+    async def slow_runner(prompt):
+        try:
+            await asyncio.sleep(5)  # 遠超 call_timeout
+            return {"result": "DONE", "cost": 0.1,
+                    "is_error": False, "num_messages": 1}
+        except asyncio.CancelledError:
+            cancelled["yes"] = True  # 逾時確實取消了呼叫（孤兒行程防護）
+            raise
+
+    sleeper, _ = _recording_sleeper()
+    res = asyncio.run(summaries.run_summary_with_retry(
+        "p", out, runner=slow_runner, sleeper=sleeper,
+        max_attempts=1, call_timeout=0.05,
+    ))
+    assert res["is_error"] is True
+    assert res["produced"] is False
+    assert res["error"] is not None and "timeout" in res["error"]
+    assert cancelled["yes"] is True
+
+
+def test_retry_timeout_then_retries(tmp_path):
+    """首次逾時、第二次成功：驗證逾時走既有失敗/重試路徑。"""
+    out = tmp_path / "o.md"
+    state = {"calls": 0}
+
+    async def runner(prompt):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            await asyncio.sleep(5)  # 首次逾時
+        out.write_text("# 摘要", encoding="utf-8")
+        return {"result": "DONE", "cost": 0.2,
+                "is_error": False, "num_messages": 3}
+
+    sleeper, delays = _recording_sleeper()
+    res = asyncio.run(summaries.run_summary_with_retry(
+        "p", out, runner=runner, sleeper=sleeper,
+        max_attempts=2, base_delay=1.0, call_timeout=0.05,
+    ))
+    assert res["produced"] is True
+    assert res["attempts"] == 2
+    assert delays == [1.0]  # 首次逾時後退避一次
+
+
+def test_retry_propagates_diagnostics(tmp_path):
+    """runner 回傳的 stderr_tail/rate_limit/stop_reason/errors 應併入 outcome。"""
+    out = tmp_path / "o.md"
+
+    async def runner(prompt):
+        out.write_text("x", encoding="utf-8")
+        return {
+            "result": "DONE", "cost": 0.1, "is_error": False, "num_messages": 1,
+            "stderr_tail": ["boom line 1", "boom line 2"],
+            "rate_limit": {"status": "rejected"}, "stop_reason": "refusal",
+            "errors": ["e1"],
+        }
+
+    sleeper, _ = _recording_sleeper()
+    res = asyncio.run(summaries.run_summary_with_retry(
+        "p", out, runner=runner, sleeper=sleeper, max_attempts=1,
+    ))
+    assert res["rate_limit"] == {"status": "rejected"}
+    assert res["stop_reason"] == "refusal"
+    assert res["errors"] == ["e1"]
+    assert res["stderr_tail"] == ["boom line 1", "boom line 2"]
+
+
+def test_retry_default_call_timeout_uses_module_constant(tmp_path, monkeypatch):
+    """call_timeout=None 時應採模組級 SDK_CALL_TIMEOUT_SEC。"""
+    out = tmp_path / "o.md"
+    monkeypatch.setattr(summaries, "SDK_CALL_TIMEOUT_SEC", 0.05)
+    cancelled = {"yes": False}
+
+    async def slow_runner(prompt):
+        try:
+            await asyncio.sleep(5)
+            return {"result": "DONE", "cost": 0.1,
+                    "is_error": False, "num_messages": 1}
+        except asyncio.CancelledError:
+            cancelled["yes"] = True
+            raise
+
+    sleeper, _ = _recording_sleeper()
+    res = asyncio.run(summaries.run_summary_with_retry(
+        "p", out, runner=slow_runner, sleeper=sleeper, max_attempts=1,
+    ))  # 未傳 call_timeout → 用模組常數 0.05
+    assert res["is_error"] is True
+    assert "timeout" in res["error"]
+    assert cancelled["yes"] is True
