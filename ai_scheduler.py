@@ -127,6 +127,13 @@ def setup_logging():
     stream_handler.setFormatter(formatter)
     logger.addHandler(stream_handler)
 
+    # 讓 SDK 自身的 logger（claude_agent_sdk.*，如 query.py 的
+    # 「Fatal error in message reader: …」）也落進同一份檔案 log，便於失敗時對照
+    # CLI 端訊息；否則這些訊息只會漏進 launchd.err.log 且同樣是佔位字串。
+    sdk_logger = logging.getLogger("claude_agent_sdk")
+    sdk_logger.setLevel(logging.INFO)
+    sdk_logger.addHandler(file_handler)
+
 
 def _run_summary_sync(task_label: str, prompt: str, output_path: Path):
     """同步執行一次摘要任務，並以「實際產出檔案」作為成功判準。
@@ -162,13 +169,24 @@ def _run_summary_sync(task_label: str, prompt: str, output_path: Path):
                 size, outcome["cost"] or 0,
             )
         else:
-            # 產出防呆：重試後仍未產出預期檔案（含空跑／SDK 錯誤情形）
+            # 產出防呆：重試後仍未產出預期檔案（含空跑／SDK 錯誤情形）。
+            # 併入 stderr 尾段、rate-limit、stop_reason、errors 等診斷資訊，
+            # 供下次失敗定調是否為 Max 訂閱用量上限節流。
             logger.error(
                 "%s 失敗（%.1f 秒，嘗試 %d 次）：預期輸出檔未產出 %s"
-                "（is_error=%s，error=%s，result=%s）",
+                "（is_error=%s，error=%s，rate_limit=%s，stop_reason=%s，"
+                "errors=%s，result=%s）",
                 task_label, elapsed, outcome["attempts"], output_path,
-                outcome["is_error"], outcome["error"], outcome["result"],
+                outcome["is_error"], outcome["error"], outcome.get("rate_limit"),
+                outcome.get("stop_reason"), outcome.get("errors"),
+                outcome["result"],
             )
+            stderr_tail = outcome.get("stderr_tail")
+            if stderr_tail:
+                logger.error(
+                    "%s CLI stderr 尾段（最後 %d 行）：\n%s",
+                    task_label, len(stderr_tail), "\n".join(stderr_tail),
+                )
 
     except Exception:
         elapsed = (datetime.now() - start).total_seconds()
