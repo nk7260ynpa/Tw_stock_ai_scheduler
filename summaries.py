@@ -15,12 +15,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
+from collections import deque
 from collections.abc import Awaitable, Callable
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
+from claude_agent_sdk import (
+    ClaudeAgentOptions,
+    RateLimitEvent,
+    ResultMessage,
+    query,
+)
 
 # ── 路徑常數 ────────────────────────────────────────────────────────────
 # 本檔所在目錄即本 repo；其上層為 Tw_stock/（Agent SDK 的工作目錄）。
@@ -47,6 +54,24 @@ NEWS_SOURCES = {
 
 # 允許的工具（與歷史可正常產出的批次腳本一致；不含 Skill，因不再走 slash）
 ALLOWED_TOOLS = ["Read", "Write", "Glob", "Grep", "Bash"]
+
+# 是否啟用 CLI 的 `--debug-to-stderr` 詳盡輸出（預設關）。開啟後 CLI 子行程 stderr
+# 會包含 API 請求／回應細節（含 rate-limit 明細），量大故僅供排錯時開啟。
+# 平時不開亦能靠 stderr callback 捕獲真正的錯誤行（見 :func:`build_options`）。
+SDK_DEBUG = os.environ.get("AI_SCHEDULER_SDK_DEBUG", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
+# 單次 SDK 呼叫逾時（秒），可由環境變數覆蓋，預設 1200（20 分）。
+# 健康的呼叫多為分鐘級，撞用量上限時單次卻可 hang 數小時；設逾時把單次上限壓到
+# 20 分，避免一次卡住吃掉整天。設為 <= 0 代表停用逾時（不建議）。
+try:
+    SDK_CALL_TIMEOUT_SEC = float(os.environ.get("SDK_CALL_TIMEOUT_SEC", "1200"))
+except (ValueError, TypeError):
+    SDK_CALL_TIMEOUT_SEC = 1200.0
 
 # 星期中文對照（datetime.weekday()：週一=0 … 週日=6）
 _WEEKDAY_ZH = ["一", "二", "三", "四", "五", "六", "日"]
@@ -269,39 +294,106 @@ def build_yt_prompt(date_str: str) -> str:
 
 
 # ── SDK 執行 ────────────────────────────────────────────────────────────
-def build_options() -> ClaudeAgentOptions:
+def build_options(
+    stderr_callback: Callable[[str], None] | None = None,
+) -> ClaudeAgentOptions:
     """建立 Agent SDK 選項（工作目錄為 Tw_stock/，使用 Max 訂閱認證）。
 
     注意：**絕不**設定 ``ANTHROPIC_API_KEY``，否則會覆蓋訂閱、改走 API 計費。
+
+    Args:
+        stderr_callback: 選用的 CLI 子行程 stderr 逐行回呼。SDK 預設**不會**擷取
+            CLI 子行程的 stderr（``ProcessError`` 只帶寫死佔位字串「Check stderr
+            output for details」），導致真正的錯誤訊息被吞掉；提供此回呼後 SDK 會
+            改為 pipe stderr 並逐行回呼，使我們能把 CLI 原始錯誤導入自家 log，
+            進而定調是否為 Max 訂閱用量上限節流。
+
+    Returns:
+        ClaudeAgentOptions: 設定好的選項。若 :data:`SDK_DEBUG` 為真，另附
+        ``extra_args={"debug-to-stderr": None}`` 讓 CLI 輸出詳盡除錯資訊。
     """
+    extra_args: dict[str, str | None] = {}
+    if SDK_DEBUG:
+        # 啟用 CLI 詳盡除錯輸出（含 API 請求／回應、rate-limit 明細）到 stderr。
+        extra_args["debug-to-stderr"] = None
     return ClaudeAgentOptions(
         allowed_tools=ALLOWED_TOOLS,
         permission_mode="acceptEdits",
         cwd=str(WORKSPACE),
+        stderr=stderr_callback,
+        extra_args=extra_args,
     )
 
 
 async def run_prompt(prompt: str) -> dict:
     """以完整 prompt 呼叫 Claude Agent SDK，串流並彙整結果。
 
+    除既有欄位外，另擷取「診斷用」資訊以利日後定調失敗根因（如用量上限）：
+
+    - ``stderr_tail``：CLI 子行程 stderr 的最後數十行（有界 ``deque``，最多 80 行）。
+    - ``rate_limit``：若 CLI 送出 ``rate_limit_event``，收其 ``RateLimitInfo`` 各欄位。
+    - ``stop_reason`` / ``errors``：來自 ``ResultMessage`` 的停止原因與錯誤清單。
+    - ``error``：SDK 串流過程若拋例外（如 ``ProcessError`` exit code 1），於此
+      收斂為字串並回傳（**不再**向外拋出），以確保 ``stderr_tail`` 等診斷資訊
+      不會因例外逸出而遺失；由呼叫端依 ``is_error`` 判定成敗。
+
+    重要：本函式**不吞** :class:`asyncio.CancelledError`（僅捕 ``Exception``），
+    故上層 :func:`asyncio.wait_for` 逾時取消時，取消會照常傳入 ``finally`` 觸發
+    async generator 的 ``aclose()``（SDK transport 會終止 CLI 子行程），避免逾時後
+    殘留孤兒行程。
+
     Args:
         prompt: 完整的任務指令（非 ``/skill`` slash）。
 
     Returns:
-        dict: 含 ``result``、``cost``、``is_error``、``num_messages`` 欄位。
+        dict: 含 ``result``/``cost``/``is_error``/``num_messages``/``stderr_tail``/
+        ``rate_limit``/``stop_reason``/``errors``/``error`` 欄位。
     """
-    data = {
+    data: dict = {
         "result": None,
         "cost": None,
         "is_error": False,
         "num_messages": 0,
+        "stderr_tail": None,
+        "rate_limit": None,
+        "stop_reason": None,
+        "errors": None,
+        "error": None,
     }
-    async for message in query(prompt=prompt, options=build_options()):
-        data["num_messages"] += 1
-        if isinstance(message, ResultMessage):
-            data["result"] = message.result
-            data["cost"] = message.total_cost_usd
-            data["is_error"] = bool(message.is_error)
+    # 有界緩衝 CLI 子行程 stderr 尾段（僅保留最後 80 行），失敗時併入 log。
+    stderr_buf: deque[str] = deque(maxlen=80)
+
+    agen = query(prompt=prompt, options=build_options(stderr_buf.append))
+    try:
+        async for message in agen:
+            data["num_messages"] += 1
+            if isinstance(message, ResultMessage):
+                data["result"] = message.result
+                data["cost"] = message.total_cost_usd
+                data["is_error"] = bool(message.is_error)
+                data["stop_reason"] = getattr(message, "stop_reason", None)
+                data["errors"] = getattr(message, "errors", None)
+            elif isinstance(message, RateLimitEvent):
+                info = message.rate_limit_info
+                data["rate_limit"] = {
+                    "status": getattr(info, "status", None),
+                    "rate_limit_type": getattr(info, "rate_limit_type", None),
+                    "utilization": getattr(info, "utilization", None),
+                    "resets_at": getattr(info, "resets_at", None),
+                    "overage_status": getattr(info, "overage_status", None),
+                }
+    except Exception as exc:  # noqa: BLE001 — 收斂 SDK 例外並保留 stderr 診斷
+        # 如 ProcessError（exit code 1）。收斂為字串回傳，避免例外逸出而遺失
+        # stderr_tail；CancelledError 屬 BaseException，不會被此攔截。
+        data["is_error"] = True
+        data["error"] = repr(exc)
+    finally:
+        # 顯式關閉 async generator：逾時取消或正常結束時皆終止 CLI 子行程，
+        # 不留孤兒行程（SDK transport 的 close() 會 terminate 子行程）。
+        aclose = getattr(agen, "aclose", None)
+        if aclose is not None:
+            await aclose()
+        data["stderr_tail"] = list(stderr_buf)
     return data
 
 
@@ -312,6 +404,7 @@ async def run_summary_with_retry(
     *,
     max_attempts: int = 3,
     base_delay: float = 15.0,
+    call_timeout: float | None = None,
     runner: Callable[[str], Awaitable[dict]] | None = None,
     sleeper: Callable[[float], Awaitable[None]] | None = None,
     log: logging.Logger | None = None,
@@ -321,22 +414,31 @@ async def run_summary_with_retry(
     可吸收 Claude Agent SDK 子程序的暫時性失敗（如 ``Command failed with exit
     code 1``，常見於撞到 Max 訂閱滾動用量上限／暫時過載），不讓單次失敗中止整批。
 
+    每次呼叫以 :func:`asyncio.wait_for` 加上**單次逾時**（``call_timeout``）：健康的
+    呼叫多為分鐘級，但撞用量上限時單次可 hang 數小時，逾時把單次上限壓到預設 20 分，
+    避免一次卡住吃掉整天。逾時會取消該次呼叫，:func:`run_prompt` 的 ``finally`` 會
+    ``aclose()`` async generator 以終止 CLI 子行程、不留孤兒。
+
     Args:
         prompt: 完整任務指令。
         output_path: 預期輸出檔；以其是否被本次嘗試產出判定成功。
         max_attempts: 最多嘗試次數（含第一次）。
         base_delay: 首次重試前的等待秒數，之後每次乘 2（指數退避）。
+        call_timeout: 單次呼叫逾時（秒）；``None`` 則用模組預設
+            :data:`SDK_CALL_TIMEOUT_SEC`（可由環境變數 ``SDK_CALL_TIMEOUT_SEC``
+            覆蓋，預設 1200）。<= 0 代表停用逾時。
         runner: 實際呼叫 SDK 的協程，預設 :func:`run_prompt`；測試可注入假物件。
         sleeper: 退避等待協程，預設 :func:`asyncio.sleep`；測試可注入假物件。
         log: 選用 logger，用於記錄各次嘗試。
 
     Returns:
         dict: 含 ``result``/``cost``/``is_error``/``num_messages``/``produced``/
-        ``attempts``/``error`` 欄位。``produced`` 為 True 且 ``is_error`` 為 False
-        才算成功。
+        ``attempts``/``error``/``stderr_tail``/``rate_limit``/``stop_reason``/
+        ``errors`` 欄位。``produced`` 為 True 且 ``is_error`` 為 False 才算成功。
     """
     runner = runner or run_prompt
     sleeper = sleeper or asyncio.sleep
+    timeout = SDK_CALL_TIMEOUT_SEC if call_timeout is None else call_timeout
 
     outcome = {
         "result": None,
@@ -346,6 +448,10 @@ async def run_summary_with_retry(
         "produced": False,
         "attempts": 0,
         "error": None,
+        "stderr_tail": None,
+        "rate_limit": None,
+        "stop_reason": None,
+        "errors": None,
     }
 
     total_cost = 0.0  # 累計各次嘗試的等價成本，避免重試時少計
@@ -355,13 +461,30 @@ async def run_summary_with_retry(
         outcome["error"] = None
         outcome["is_error"] = False
         try:
-            result = await runner(prompt)
+            if timeout and timeout > 0:
+                result = await asyncio.wait_for(runner(prompt), timeout=timeout)
+            else:
+                result = await runner(prompt)
             outcome["result"] = result.get("result")
             total_cost += result.get("cost") or 0
             outcome["cost"] = total_cost
             outcome["is_error"] = bool(result.get("is_error"))
             outcome["num_messages"] = result.get("num_messages", 0)
-        except Exception as exc:  # SDK 子程序 exit 1／暫時性過載等
+            outcome["stderr_tail"] = result.get("stderr_tail")
+            outcome["rate_limit"] = result.get("rate_limit")
+            outcome["stop_reason"] = result.get("stop_reason")
+            outcome["errors"] = result.get("errors")
+            if result.get("error"):  # run_prompt 收斂的 SDK 例外
+                outcome["error"] = result.get("error")
+        except asyncio.TimeoutError:  # 單次呼叫逾時：已取消並終止 CLI 子行程
+            outcome["error"] = f"timeout after {timeout:.0f}s"
+            outcome["is_error"] = True
+            if log:
+                log.warning(
+                    "第 %d/%d 次嘗試逾時（>%.0f 秒），已終止呼叫並視為失敗",
+                    attempt, max_attempts, timeout,
+                )
+        except Exception as exc:  # 其他未預期例外（防禦性）
             outcome["error"] = repr(exc)
             outcome["is_error"] = True
             if log:
@@ -378,9 +501,10 @@ async def run_summary_with_retry(
             delay = base_delay * (2 ** (attempt - 1))
             if log:
                 log.warning(
-                    "第 %d/%d 次未成功（produced=%s, error=%s），%.0f 秒後重試",
-                    attempt, max_attempts, outcome["produced"],
-                    outcome["error"], delay,
+                    "第 %d/%d 次未成功（produced=%s, error=%s, rate_limit=%s, "
+                    "stop_reason=%s），%.0f 秒後重試",
+                    attempt, max_attempts, outcome["produced"], outcome["error"],
+                    outcome["rate_limit"], outcome["stop_reason"], delay,
                 )
             await sleeper(delay)
 
@@ -461,11 +585,19 @@ async def backfill_one_day(
         log_fn = log.info if produced else log.error
         log_fn(
             "%s %s: 嘗試=%d 訊息=%d 耗時=%.1fs cost=$%.4f "
-            "produced=%s error=%s size=%d",
+            "produced=%s error=%s rate_limit=%s stop_reason=%s size=%d",
             date_str, "成功" if produced else "失敗", outcome["attempts"],
             outcome["num_messages"], elapsed, outcome["cost"] or 0,
-            outcome["produced"], outcome["error"], size,
+            outcome["produced"], outcome["error"], outcome.get("rate_limit"),
+            outcome.get("stop_reason"), size,
         )
+        # 失敗時額外印出 CLI stderr 尾段，便於定調根因（如用量上限節流）。
+        if not produced and outcome.get("stderr_tail"):
+            tail = outcome["stderr_tail"]
+            log.error(
+                "%s CLI stderr 尾段（最後 %d 行）：\n%s",
+                date_str, len(tail), "\n".join(tail),
+            )
         return {
             "date": date_str, "status": status, "elapsed": elapsed,
             "cost": outcome["cost"] or 0, "file_size": size,
